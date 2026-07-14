@@ -1,0 +1,465 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://feedling.app/schemas/qa/memory-contract-receipt-v1.json",
+  "title": "Feedling memory contract smoke receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "profile_id",
+    "target",
+    "account_lifecycle",
+    "status",
+    "failure_code",
+    "release_qualified",
+    "checks",
+    "summary",
+    "sensitive_data_persisted",
+    "raw_responses_persisted",
+    "raw_memory_ids_persisted"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "memory_contract_smoke"},
+    "profile_id": {"const": "memory-contract"},
+    "target": {"const": "test"},
+    "account_lifecycle": {"const": "externally_managed"},
+    "status": {"enum": ["PASS", "FAIL", "UNVERIFIED"]},
+    "failure_code": {
+      "enum": [
+        "NONE",
+        "API_REQUEST_FAILED",
+        "INTERNAL_CHECK_ERROR",
+        "FRESH_ACCOUNT_NOT_EMPTY",
+        "FRESH_EMPTY_RECALL_FAILED",
+        "KEY_MATERIAL_UNAVAILABLE",
+        "ENCRYPTED_WRITE_FAILED",
+        "ENCRYPTED_STORAGE_FAILED",
+        "INDEX_FETCH_FAILED",
+        "CAPTURE_MESSAGE_FAILED",
+        "CAPTURE_HISTORY_FAILED",
+        "CAPTURE_EXECUTOR_FAILED",
+        "CAPTURE_WRITE_FAILED",
+        "FLOW_TRACE_FAILED",
+        "CAPTURE_NOOP_FAILED",
+        "CAPTURE_DEDUP_FAILED",
+        "LOCAL_ONLY_FAILED",
+        "SUPERSEDE_FAILED",
+        "MIGRATION_DISABLED",
+        "LEGACY_MIGRATION_FAILED",
+        "STALE_CAS_FAILED"
+      ]
+    },
+    "release_qualified": {"const": false},
+    "checks": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "prefixItems": [
+        {"$ref": "#/$defs/fresh"},
+        {"$ref": "#/$defs/encrypted"},
+        {"$ref": "#/$defs/captureWrite"},
+        {"$ref": "#/$defs/routeTrace"},
+        {"$ref": "#/$defs/captureNoop"},
+        {"$ref": "#/$defs/captureDedup"},
+        {"$ref": "#/$defs/localOnly"},
+        {"$ref": "#/$defs/supersede"},
+        {"$ref": "#/$defs/migration"},
+        {"$ref": "#/$defs/cas"}
+      ],
+      "items": false
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pass", "fail", "not_exercised", "not_run"],
+      "properties": {
+        "pass": {"type": "integer", "minimum": 0, "maximum": 10},
+        "fail": {"type": "integer", "minimum": 0, "maximum": 1},
+        "not_exercised": {"type": "integer", "minimum": 0, "maximum": 2},
+        "not_run": {"type": "integer", "minimum": 0, "maximum": 9}
+      }
+    },
+    "sensitive_data_persisted": {"const": false},
+    "raw_responses_persisted": {"const": false},
+    "raw_memory_ids_persisted": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "failure_code": {"const": "NONE"},
+          "checks": {
+            "prefixItems": [
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}},
+              {"properties": {"status": {"const": "PASS"}, "failure_code": {"const": "NONE"}}}
+            ]
+          },
+          "summary": {
+            "properties": {
+              "pass": {"const": 10},
+              "fail": {"const": 0},
+              "not_exercised": {"const": 0},
+              "not_run": {"const": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "UNVERIFIED"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "failure_code": {"const": "MIGRATION_DISABLED"},
+          "checks": {
+            "prefixItems": [
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "PASS"}}},
+              {"properties": {"status": {"const": "NOT_EXERCISED"}, "failure_code": {"const": "MIGRATION_DISABLED"}}},
+              {"properties": {"status": {"const": "NOT_EXERCISED"}, "failure_code": {"const": "MIGRATION_DISABLED"}}}
+            ]
+          },
+          "summary": {
+            "properties": {
+              "pass": {"const": 8},
+              "fail": {"const": 0},
+              "not_exercised": {"const": 2},
+              "not_run": {"const": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "FAIL"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "failure_code": {"not": {"enum": ["NONE", "MIGRATION_DISABLED"]}},
+          "summary": {"properties": {"fail": {"const": 1}}}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "failureCode": {
+      "enum": [
+        "NONE",
+        "API_REQUEST_FAILED",
+        "INTERNAL_CHECK_ERROR",
+        "FRESH_ACCOUNT_NOT_EMPTY",
+        "FRESH_EMPTY_RECALL_FAILED",
+        "KEY_MATERIAL_UNAVAILABLE",
+        "ENCRYPTED_WRITE_FAILED",
+        "ENCRYPTED_STORAGE_FAILED",
+        "INDEX_FETCH_FAILED",
+        "CAPTURE_MESSAGE_FAILED",
+        "CAPTURE_HISTORY_FAILED",
+        "CAPTURE_EXECUTOR_FAILED",
+        "CAPTURE_WRITE_FAILED",
+        "FLOW_TRACE_FAILED",
+        "CAPTURE_NOOP_FAILED",
+        "CAPTURE_DEDUP_FAILED",
+        "LOCAL_ONLY_FAILED",
+        "SUPERSEDE_FAILED",
+        "MIGRATION_DISABLED",
+        "LEGACY_MIGRATION_FAILED",
+        "STALE_CAS_FAILED",
+        "DEPENDENCY_NOT_RUN"
+      ]
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "fetch_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "missing_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "unavailable_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "stored_record_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "default_visible_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "explicit_visible_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "before_card_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "after_card_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "capture_job_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "cards_added": {"type": "integer", "minimum": 0, "maximum": 2},
+        "cards_superseded": {"type": "integer", "minimum": 0, "maximum": 2},
+        "route_event_count": {"type": "integer", "minimum": 0, "maximum": 50},
+        "encrypted_at_rest": {"type": "boolean"},
+        "round_trip_verified": {"type": "boolean"},
+        "quiet_window_enqueued": {"type": "boolean"},
+        "capture_noop": {"type": "boolean"},
+        "route_event_correlated": {"type": "boolean"},
+        "bucket_vocab_unchanged": {"type": "boolean"},
+        "thread_vocab_unchanged": {"type": "boolean"},
+        "existing_card_preserved": {"type": "boolean"},
+        "local_only_excluded": {"type": "boolean"},
+        "superseded_hidden_by_default": {"type": "boolean"},
+        "replacement_visible": {"type": "boolean"},
+        "stable_id_preserved": {"type": "boolean"},
+        "legacy_shape_removed": {"type": "boolean"},
+        "stale_write_rejected": {"type": "boolean"},
+        "winning_update_preserved": {"type": "boolean"},
+        "concurrent_card_preserved": {"type": "boolean"}
+      }
+    },
+    "checkBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "layer", "status", "failure_code", "observations"],
+      "properties": {
+        "id": {"type": "string"},
+        "layer": {"enum": ["live_api", "deployed_backend_contract"]},
+        "status": {"enum": ["PASS", "FAIL", "NOT_EXERCISED", "NOT_RUN"]},
+        "failure_code": {"$ref": "#/$defs/failureCode"},
+        "observations": {"$ref": "#/$defs/observations"}
+      }
+    },
+    "fresh": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "fresh_empty_recall"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["index_count", "fetch_count", "missing_count"],
+                "properties": {
+                  "index_count": {"const": 0},
+                  "fetch_count": {"const": 0},
+                  "missing_count": {"const": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "encrypted": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "encrypted_v1_index_fetch"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["stored_record_count", "index_count", "fetch_count", "encrypted_at_rest", "round_trip_verified"],
+                "properties": {
+                  "stored_record_count": {"const": 1},
+                  "index_count": {"const": 1},
+                  "fetch_count": {"const": 1},
+                  "encrypted_at_rest": {"const": true},
+                  "round_trip_verified": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "captureWrite": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "quiet_window_capture_write"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["before_card_count", "after_card_count", "capture_job_count", "cards_added", "cards_superseded", "quiet_window_enqueued", "capture_noop", "fetch_count", "round_trip_verified"],
+                "properties": {
+                  "capture_job_count": {"const": 1},
+                  "cards_added": {"const": 1},
+                  "cards_superseded": {"const": 0},
+                  "quiet_window_enqueued": {"const": true},
+                  "capture_noop": {"const": false},
+                  "fetch_count": {"const": 1},
+                  "round_trip_verified": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "routeTrace": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "route_chat_message_trace"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["route_event_count", "route_event_correlated"],
+                "properties": {
+                  "route_event_count": {"const": 1},
+                  "route_event_correlated": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "captureNoop": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "capture_noop_disposable_chitchat"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["before_card_count", "after_card_count", "capture_job_count", "cards_added", "cards_superseded", "quiet_window_enqueued", "capture_noop", "bucket_vocab_unchanged", "thread_vocab_unchanged"],
+                "properties": {
+                  "capture_job_count": {"const": 1},
+                  "cards_added": {"const": 0},
+                  "cards_superseded": {"const": 0},
+                  "quiet_window_enqueued": {"const": true},
+                  "capture_noop": {"const": true},
+                  "bucket_vocab_unchanged": {"const": true},
+                  "thread_vocab_unchanged": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "captureDedup": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "duplicate_fact_no_growth"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["before_card_count", "after_card_count", "capture_job_count", "cards_added", "cards_superseded", "quiet_window_enqueued", "capture_noop", "fetch_count", "bucket_vocab_unchanged", "thread_vocab_unchanged", "existing_card_preserved"],
+                "properties": {
+                  "capture_job_count": {"const": 1},
+                  "cards_added": {"const": 0},
+                  "cards_superseded": {"const": 0},
+                  "quiet_window_enqueued": {"const": true},
+                  "capture_noop": {"const": true},
+                  "fetch_count": {"const": 1},
+                  "bucket_vocab_unchanged": {"const": true},
+                  "thread_vocab_unchanged": {"const": true},
+                  "existing_card_preserved": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "localOnly": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "local_only_exclusion"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["index_count", "fetch_count", "unavailable_count", "local_only_excluded"],
+                "properties": {
+                  "index_count": {"const": 0},
+                  "fetch_count": {"const": 0},
+                  "unavailable_count": {"const": 1},
+                  "local_only_excluded": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "supersede": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "supersede_visibility"}, "layer": {"const": "live_api"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["default_visible_count", "explicit_visible_count", "unavailable_count", "superseded_hidden_by_default", "replacement_visible"],
+                "properties": {
+                  "default_visible_count": {"const": 1},
+                  "explicit_visible_count": {"const": 1},
+                  "unavailable_count": {"const": 1},
+                  "superseded_hidden_by_default": {"const": true},
+                  "replacement_visible": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "migration": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "legacy_migration_stable_id"}, "layer": {"const": "deployed_backend_contract"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["fetch_count", "stable_id_preserved", "legacy_shape_removed", "round_trip_verified"],
+                "properties": {
+                  "fetch_count": {"const": 1},
+                  "stable_id_preserved": {"const": true},
+                  "legacy_shape_removed": {"const": true},
+                  "round_trip_verified": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "cas": {
+      "allOf": [
+        {"$ref": "#/$defs/checkBase"},
+        {"properties": {"id": {"const": "stale_cas_preserves_concurrent_updates"}, "layer": {"const": "deployed_backend_contract"}}},
+        {
+          "if": {"properties": {"status": {"const": "PASS"}}},
+          "then": {
+            "properties": {
+              "observations": {
+                "required": ["fetch_count", "stable_id_preserved", "stale_write_rejected", "winning_update_preserved", "concurrent_card_preserved"],
+                "properties": {
+                  "fetch_count": {"const": 2},
+                  "stable_id_preserved": {"const": true},
+                  "stale_write_rejected": {"const": true},
+                  "winning_update_preserved": {"const": true},
+                  "concurrent_card_preserved": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -535,6 +535,10 @@ class SmokeClient:
             "/v1/model_api/chat/send",
             api_key=sess.api_key,
             body={"message": message},
+            # This mutation has no idempotency key. If the server accepts the
+            # turn but its response is lost, replaying the POST creates a second
+            # user turn and can make qualification evaluate the wrong reply.
+            attempts=1,
         )
         if status != 202 or not is_hosted_response(body):
             raise SmokeError(

@@ -1,0 +1,1 @@
+Mira and Rowan celebrate Lantern Evening with tomato noodles and the album Kind of Blue. Mira's helpful pattern is to acknowledge the feeling, offer one concrete next step, and avoid preachy language. Rowan's reliable reset ritual is jasmine tea followed by a ten-minute walk.

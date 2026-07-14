@@ -26,6 +26,7 @@ flag FEEDLING_GENESIS_WORKER_ENABLED=1). Crypto matches content_encryption.build
              --semantic-judgment </private/tmp/judgment.json> \
              --artifact-dir <QA_ARTIFACT_DIR>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,6 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -66,7 +68,71 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
         )
 
 
-def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
+def _multipart_form_body(
+    fields: dict[str, str],
+    file_upload: dict[str, object],
+) -> tuple[bytes, str]:
+    """Encode one bounded multipart file without leaking it through temp files."""
+    boundary = "----feedling-qa-" + os.urandom(16).hex()
+    field_name = str(file_upload.get("field_name") or "")
+    filename = str(file_upload.get("filename") or "")
+    content_type = str(file_upload.get("content_type") or "")
+    content = file_upload.get("content")
+    header_values = [field_name, filename, content_type, *map(str, fields.keys())]
+    if any("\r" in value or "\n" in value for value in header_values):
+        raise ValueError("multipart header injection rejected")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", field_name):
+        raise ValueError("multipart field name invalid")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", filename):
+        raise ValueError("multipart filename invalid")
+    if not re.fullmatch(r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+", content_type):
+        raise ValueError("multipart content type invalid")
+    if not isinstance(content, bytes) or not content:
+        raise ValueError("multipart file content invalid")
+
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        name = str(key)
+        rendered = str(value)
+        if "\r" in rendered or "\n" in rendered:
+            raise ValueError("multipart field value invalid")
+        chunks.extend(
+            (
+                f"--{boundary}\r\n".encode("ascii"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                    "ascii"
+                ),
+                rendered.encode("utf-8"),
+                b"\r\n",
+            )
+        )
+    chunks.extend(
+        (
+            f"--{boundary}\r\n".encode("ascii"),
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; '
+                f'filename="{filename}"\r\n'
+            ).encode("ascii"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+            content,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("ascii"),
+        )
+    )
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _http(
+    method,
+    url,
+    api_key,
+    *,
+    json_body=None,
+    multipart_fields=None,
+    file_upload=None,
+    timeout=60,
+    retries=8,
+):
     """Single request with retry on transient read/connection errors (IncompleteRead,
     URLError, socket timeout). HTTPError (a real status) is returned immediately, never
     retried. Generous retries + backoff because the local proxy (198.18 fake-IP) flaps
@@ -77,7 +143,20 @@ def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
     import http.client
     import socket
 
-    data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+    if json_body is not None and (
+        multipart_fields is not None or file_upload is not None
+    ):
+        raise ValueError("request body modes are mutually exclusive")
+    if multipart_fields is not None or file_upload is not None:
+        if not isinstance(multipart_fields, dict) or not isinstance(file_upload, dict):
+            raise ValueError("multipart request invalid")
+        data, request_content_type = _multipart_form_body(
+            {str(key): str(value) for key, value in multipart_fields.items()},
+            file_upload,
+        )
+    else:
+        data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+        request_content_type = "application/json"
     last_exc = None
     opener = urllib.request.build_opener(_RejectRedirects())
     for attempt in range(retries):
@@ -85,7 +164,7 @@ def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
             url,
             data=data,
             method=method,
-            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+            headers={"X-API-Key": api_key, "Content-Type": request_content_type},
         )
         try:
             with opener.open(req, timeout=timeout) as resp:
@@ -615,6 +694,41 @@ def _privacy_surface_has_forbidden(surface: object, forbidden: list[str]) -> boo
     return False
 
 
+def _utc_today() -> date:
+    """Return the qualification clock's UTC calendar date.
+
+    The deployed backend may use a neighboring local calendar date around UTC
+    midnight, so relationship-duration qualification accepts a one-day window
+    around this value while still requiring the stored anchor itself exactly.
+    """
+
+    return datetime.now(timezone.utc).date()
+
+
+def _relationship_checks(relationship: dict, identity_meta: dict) -> tuple[bool, bool]:
+    expected_start = str(relationship.get("relationship_started_at") or "").strip()
+    stored_start = str(identity_meta.get("relationship_started_at") or "").strip()
+    days = identity_meta.get("days_with_user")
+
+    if expected_start:
+        try:
+            start_date = date.fromisoformat(expected_start)
+        except ValueError:
+            return False, False
+        anchor_exact = stored_start == expected_start
+        expected_days = max(0, (_utc_today() - start_date).days)
+        days_match = type(days) is int and days >= 0 and abs(days - expected_days) <= 1
+        return anchor_exact, days_match
+
+    # Preserve the generic acceptance helper's older explicit-duration contract.
+    # The locked P0-06 fixture always supplies an exact relationship start date.
+    expected_days = relationship.get("expected_days_with_user")
+    return (
+        True,
+        type(days) is int and isinstance(expected_days, int) and days == expected_days,
+    )
+
+
 def evaluate_distill_acceptance(
     fixture: dict,
     *,
@@ -650,7 +764,6 @@ def evaluate_distill_acceptance(
     expected_dims = [
         d for d in (expected_persona.get("dimensions") or []) if isinstance(d, dict)
     ]
-    expected_days = relationship.get("expected_days_with_user")
     expected_fact_ids = [str(fact.get("id") or "") for fact in expected_facts]
     semantic = _semantic_judgment_summary(
         semantic_judgment, expected_fact_ids, evidence_sha256
@@ -714,11 +827,9 @@ def evaluate_distill_acceptance(
         else []
     )
     days = identity_meta.get("days_with_user")
-    if not isinstance(days, int):
-        try:
-            days = int(days)
-        except Exception:
-            days = None
+    relationship_anchor_exact, relationship_days_match = _relationship_checks(
+        relationship, identity_meta
+    )
     greeting_ok = any(
         str(m.get("content") or m.get("text") or "").strip()
         and str(m.get("role") or "").lower() in _AGENT_CHAT_ROLES
@@ -771,11 +882,8 @@ def evaluate_distill_acceptance(
         "ground_truth_recall": len(missed) == 0,
         "no_explicit_contradictions": len(contradicted) == 0,
         "no_duplicate_memories": len(duplicates) == 0,
-        "relationship_days": (
-            (days == expected_days)
-            if isinstance(expected_days, int)
-            else isinstance(days, int)
-        ),
+        "relationship_started_at": relationship_anchor_exact,
+        "relationship_days": relationship_days_match,
         "greeting_non_empty": greeting_ok,
         "persona_non_empty": bool(
             str(persona_text or "").strip()
@@ -840,7 +948,8 @@ def evaluate_distill_acceptance(
             "category_present": bool(category),
             "dimension_count": len(dims),
             "self_introduction_present": bool(self_intro),
-            "relationship_days_present": isinstance(days, int),
+            "relationship_started_at_matches": relationship_anchor_exact,
+            "relationship_days_present": type(days) is int,
         },
         "validate_summary": {"passing": bool(validate.get("passing"))},
     }
@@ -906,10 +1015,54 @@ def render_distill_acceptance_report(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+_UPLOAD_MATERIALS = (
+    ("chat_history", "history_filename"),
+    ("ai_persona", "ai_persona_filename"),
+    ("personal_profile", "personal_profile_filename"),
+    ("memory_summary", "memory_summary_filename"),
+)
+_MAX_QUALIFICATION_UPLOAD_BYTES = 1024 * 1024
+
+
 def _load_fixture(path: str) -> dict:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    fixture_path = Path(path)
+    data = json.loads(fixture_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise SystemExit("fixture must be a JSON object")
+    materials = data.get("materials") if isinstance(data.get("materials"), dict) else {}
+    upload_files = (
+        materials.get("upload_files")
+        if isinstance(materials.get("upload_files"), dict)
+        else None
+    )
+    if upload_files is not None:
+        expected = {material for material, _filename_field in _UPLOAD_MATERIALS}
+        if set(upload_files) != expected:
+            raise ExistingSessionDistillError("fixture", "four_upload_files_required")
+        fixture_root = fixture_path.parent.resolve(strict=True)
+        for material, _filename_field in _UPLOAD_MATERIALS:
+            spec = upload_files.get(material)
+            relative = str(spec.get("path") or "") if isinstance(spec, dict) else ""
+            candidate = fixture_path.parent / relative
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(fixture_root)
+                metadata = candidate.lstat()
+                if candidate.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                    raise OSError
+                raw = candidate.read_bytes()
+            except (OSError, ValueError):
+                raise ExistingSessionDistillError(
+                    "fixture", "upload_file_unreadable"
+                ) from None
+            if not raw or len(raw) > _MAX_QUALIFICATION_UPLOAD_BYTES:
+                raise ExistingSessionDistillError("fixture", "upload_file_size_invalid")
+            try:
+                materials[material] = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ExistingSessionDistillError(
+                    "fixture", "upload_file_encoding_invalid"
+                ) from None
     return data
 
 
@@ -1192,6 +1345,7 @@ def _decrypt_chat_history(
 
 
 _QUALIFICATION_JOB_ID_RE = re.compile(r"^genesis_[0-9a-f]{16}$")
+_QUALIFICATION_ARCHIVE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _require_success_status(status: int, stage: str, rejection_code: str) -> None:
@@ -1244,7 +1398,120 @@ def _existing_session_request(
     return response
 
 
-def _build_existing_session_payload(fixture: dict, client_job_id: str) -> dict:
+def _qualification_material_uploads(fixture: dict) -> list[dict]:
+    materials = (
+        fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
+    )
+    specs = (
+        materials.get("upload_files")
+        if isinstance(materials.get("upload_files"), dict)
+        else {}
+    )
+    if set(specs) != {material for material, _field in _UPLOAD_MATERIALS}:
+        raise ExistingSessionDistillError("fixture", "four_upload_files_required")
+    uploads: list[dict] = []
+    filenames: set[str] = set()
+    for material, filename_field in _UPLOAD_MATERIALS:
+        spec = specs.get(material)
+        if not isinstance(spec, dict):
+            raise ExistingSessionDistillError("fixture", "upload_file_spec_invalid")
+        filename = str(spec.get("filename") or "")
+        content_type = str(spec.get("content_type") or "")
+        content_text = materials.get(material)
+        if not isinstance(content_text, str) or not content_text.strip():
+            raise ExistingSessionDistillError("fixture", "four_materials_required")
+        content = content_text.encode("utf-8")
+        if not content or len(content) > _MAX_QUALIFICATION_UPLOAD_BYTES:
+            raise ExistingSessionDistillError("fixture", "upload_file_size_invalid")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", filename):
+            raise ExistingSessionDistillError("fixture", "upload_filename_invalid")
+        if filename in filenames:
+            raise ExistingSessionDistillError("fixture", "upload_filename_duplicate")
+        if not re.fullmatch(r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+", content_type):
+            raise ExistingSessionDistillError("fixture", "upload_content_type_invalid")
+        filenames.add(filename)
+        uploads.append(
+            {
+                "material": material,
+                "filename_field": filename_field,
+                "filename": filename,
+                "content_type": content_type,
+                "content": content,
+                "content_text": content_text,
+                "content_sha256": _sha256_hex(content),
+                "size_bytes": len(content),
+            }
+        )
+    return uploads
+
+
+def _archive_existing_session_materials(
+    *,
+    request_fn,
+    base: str,
+    api_key: str,
+    user_id: str,
+    client_job_id: str,
+    uploads: list[dict],
+) -> list[dict]:
+    receipts: list[dict] = []
+    for upload in uploads:
+        material = str(upload["material"])
+        stage = f"archive_{material}"
+        status, body = _existing_session_request(
+            request_fn,
+            "POST",
+            f"{base}/v1/onboarding/archive",
+            api_key,
+            stage,
+            multipart_fields={
+                "filename": upload["filename"],
+                "content_type": upload["content_type"],
+                "client_job_id": client_job_id,
+            },
+            file_upload={
+                "field_name": "file",
+                "filename": upload["filename"],
+                "content_type": upload["content_type"],
+                "content": upload["content"],
+            },
+            # The archive endpoint has no idempotency lookup. A lost success
+            # response must fail closed instead of retrying a duplicate upload.
+            retries=1,
+        )
+        _require_success_status(status, stage, "archive_rejected")
+        archive_id = str(body.get("archive_id") or "")
+        expected_key = (
+            f"onboarding/{user_id}/{archive_id}/{upload['filename']}"
+            if _QUALIFICATION_ARCHIVE_ID_RE.fullmatch(archive_id)
+            else ""
+        )
+        if (
+            status != 201
+            or body.get("status") != "ok"
+            or not _QUALIFICATION_ARCHIVE_ID_RE.fullmatch(archive_id)
+            or str(body.get("key") or "") != expected_key
+        ):
+            raise ExistingSessionDistillError(stage, "archive_receipt_invalid", status)
+        receipts.append(
+            {
+                "material": material,
+                "filename": upload["filename"],
+                "content_type": upload["content_type"],
+                "content_sha256": upload["content_sha256"],
+                "size_bytes": upload["size_bytes"],
+                "http_status": status,
+                "archive_id": archive_id,
+                "upload_accepted": True,
+                "storage_key_scope_verified": True,
+            }
+        )
+    return receipts
+
+
+def _build_existing_session_payload(
+    fixture: dict, client_job_id: str, uploads: list[dict]
+) -> dict:
     materials = (
         fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
     )
@@ -1271,7 +1538,67 @@ def _build_existing_session_payload(fixture: dict, client_job_id: str) -> dict:
         value = materials.get(src_key)
         if value:
             payload[payload_key] = str(value)
+    for upload in uploads:
+        payload[str(upload["filename_field"])] = str(upload["filename"])
     return payload
+
+
+def _job_upload_metadata_evidence(job: dict, expected_client_job_id: str) -> dict:
+    """Require and validate the deployed Genesis filename/source metadata."""
+    metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    if "client_job_id" not in metadata:
+        raise ExistingSessionDistillError("distill", "job_client_job_id_missing")
+    if str(metadata.get("client_job_id") or "") != expected_client_job_id:
+        raise ExistingSessionDistillError("distill", "job_client_job_id_mismatch")
+    file_count_exposed = "file_count" in metadata
+    source_fields = {
+        "history": "history_count",
+        "ai_persona": "ai_persona_count",
+        "user_profile": "user_profile_count",
+        "memory_summary": "memory_summary_count",
+    }
+    exposed_source_fields = [
+        field for field in source_fields.values() if field in metadata
+    ]
+    if exposed_source_fields and len(exposed_source_fields) != len(source_fields):
+        raise ExistingSessionDistillError("distill", "job_source_counts_incomplete")
+    source_counts_exposed = len(exposed_source_fields) == len(source_fields)
+    if file_count_exposed:
+        try:
+            file_count = int(metadata["file_count"])
+        except (TypeError, ValueError):
+            raise ExistingSessionDistillError(
+                "distill", "job_file_count_invalid"
+            ) from None
+        if file_count != len(_UPLOAD_MATERIALS):
+            raise ExistingSessionDistillError("distill", "job_file_count_mismatch")
+    else:
+        file_count = None
+
+    source_families: list[str] = []
+    if source_counts_exposed:
+        for family, field in source_fields.items():
+            try:
+                count = int(metadata[field])
+            except (TypeError, ValueError):
+                raise ExistingSessionDistillError(
+                    "distill", "job_source_counts_invalid"
+                ) from None
+            if count <= 0:
+                raise ExistingSessionDistillError(
+                    "distill", "job_source_family_missing"
+                )
+            source_families.append(family)
+    if not file_count_exposed or not source_counts_exposed:
+        raise ExistingSessionDistillError("distill", "job_upload_metadata_missing")
+    return {
+        "client_job_id_exposed": True,
+        "client_job_id_matched": True,
+        "file_count_exposed": file_count_exposed,
+        "file_count": file_count,
+        "source_counts_exposed": source_counts_exposed,
+        "source_families": source_families,
+    }
 
 
 def _job_view(body: dict) -> dict:
@@ -1354,9 +1681,22 @@ def capture_existing_session_distill_evidence(
     request = request_fn or _http
     base = _qualification_base_url(api_url)
     job_token = client_job_id or ("qa_existing_distill_" + os.urandom(8).hex())
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{8,96}", job_token):
+    # Match the Genesis backend's client-job normalization exactly.  The archive
+    # endpoint stores this value verbatim, while Genesis strips characters
+    # outside [A-Za-z0-9_-]; accepting dots here would silently break the shared
+    # token that binds the two requests.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,96}", job_token):
         raise ExistingSessionDistillError("fixture", "client_job_id_invalid")
-    payload = _build_existing_session_payload(fixture, job_token)
+    uploads = _qualification_material_uploads(fixture)
+    archive_receipts = _archive_existing_session_materials(
+        request_fn=request,
+        base=base,
+        api_key=api_key,
+        user_id=user_id,
+        client_job_id=job_token,
+        uploads=uploads,
+    )
+    payload = _build_existing_session_payload(fixture, job_token, uploads)
     status, body = _existing_session_request(
         request,
         "POST",
@@ -1395,6 +1735,7 @@ def capture_existing_session_distill_evidence(
         raise ExistingSessionDistillError("distill", "job_failed")
     if terminal != "done":
         raise ExistingSessionDistillError("distill", "job_timeout")
+    job_upload_metadata = _job_upload_metadata_evidence(job, job_token)
 
     identity_plain: dict = {}
     identity_meta: dict = {}
@@ -1520,6 +1861,13 @@ def capture_existing_session_distill_evidence(
             persona_text = ""
 
     capture_checks = {
+        "archive_receipts_verified": len(archive_receipts) == len(_UPLOAD_MATERIALS),
+        "genesis_upload_metadata_verified": bool(
+            job_upload_metadata["client_job_id_exposed"]
+            and job_upload_metadata["client_job_id_matched"]
+            and job_upload_metadata["file_count_exposed"]
+            and job_upload_metadata["source_counts_exposed"]
+        ),
         "identity_envelope_decrypted": identity_decrypted,
         "persona_envelope_decrypted": persona_decrypted,
         "memory_envelopes_decrypted": memory_decrypt_error_count == 0,
@@ -1532,6 +1880,9 @@ def capture_existing_session_distill_evidence(
         "created_user": False,
         "configured_provider": False,
         "job_status": terminal,
+        "archive_upload_count": len(archive_receipts),
+        "archive_receipts": archive_receipts,
+        "genesis_upload_metadata": job_upload_metadata,
         "upload_http_status": status,
         "memory_http_status": memory_status,
         "validate_http_status": validate_status,
@@ -1555,7 +1906,10 @@ def capture_existing_session_distill_evidence(
         "fixture_sha256": fixture_sha256,
         "expected_fact_ids": expected_fact_ids,
         "identity": identity_plain,
-        "identity_meta": {"days_with_user": identity_meta.get("days_with_user")},
+        "identity_meta": {
+            "days_with_user": identity_meta.get("days_with_user"),
+            "relationship_started_at": identity_meta.get("relationship_started_at"),
+        },
         "persona_text": persona_text,
         "memories": memories,
         "greeting_messages": decrypted_chat_messages,
@@ -1597,6 +1951,110 @@ _PRIVATE_EVIDENCE_KEYS = {
 }
 
 
+def _valid_existing_session_transport(value: object, fixture: dict) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "used_existing_session",
+        "created_user",
+        "configured_provider",
+        "job_status",
+        "archive_upload_count",
+        "archive_receipts",
+        "genesis_upload_metadata",
+        "upload_http_status",
+        "memory_http_status",
+        "validate_http_status",
+        "memory_decrypt_error_count",
+        "chat_decrypt_error_count",
+        "decrypted_agent_message_count",
+    }:
+        return False
+    if (
+        value["used_existing_session"] is not True
+        or value["created_user"] is not False
+        or value["configured_provider"] is not False
+        or value["job_status"] != "done"
+        or value["archive_upload_count"] != len(_UPLOAD_MATERIALS)
+    ):
+        return False
+    integer_fields = (
+        "upload_http_status",
+        "memory_http_status",
+        "validate_http_status",
+        "memory_decrypt_error_count",
+        "chat_decrypt_error_count",
+        "decrypted_agent_message_count",
+    )
+    if any(type(value.get(field)) is not int for field in integer_fields):
+        return False
+    receipts = value.get("archive_receipts")
+    if not isinstance(receipts, list) or len(receipts) != len(_UPLOAD_MATERIALS):
+        return False
+    try:
+        expected_uploads = _qualification_material_uploads(fixture)
+    except ExistingSessionDistillError:
+        return False
+    archive_ids: set[str] = set()
+    for expected_upload, receipt in zip(expected_uploads, receipts, strict=True):
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "material",
+            "filename",
+            "content_type",
+            "content_sha256",
+            "size_bytes",
+            "http_status",
+            "archive_id",
+            "upload_accepted",
+            "storage_key_scope_verified",
+        }:
+            return False
+        archive_id = str(receipt.get("archive_id") or "")
+        if (
+            receipt.get("material") != expected_upload["material"]
+            or receipt.get("filename") != expected_upload["filename"]
+            or receipt.get("content_type") != expected_upload["content_type"]
+            or receipt.get("content_sha256") != expected_upload["content_sha256"]
+            or receipt.get("size_bytes") != expected_upload["size_bytes"]
+            or receipt.get("http_status") != 201
+            or not _QUALIFICATION_ARCHIVE_ID_RE.fullmatch(archive_id)
+            or archive_id in archive_ids
+            or receipt.get("upload_accepted") is not True
+            or receipt.get("storage_key_scope_verified") is not True
+        ):
+            return False
+        archive_ids.add(archive_id)
+    metadata = value.get("genesis_upload_metadata")
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "client_job_id_exposed",
+        "client_job_id_matched",
+        "file_count_exposed",
+        "file_count",
+        "source_counts_exposed",
+        "source_families",
+    }:
+        return False
+    if (
+        type(metadata["client_job_id_exposed"]) is not bool
+        or type(metadata["client_job_id_matched"]) is not bool
+        or type(metadata["file_count_exposed"]) is not bool
+        or type(metadata["source_counts_exposed"]) is not bool
+    ):
+        return False
+    if (
+        metadata["client_job_id_exposed"] is not True
+        or metadata["client_job_id_matched"] is not True
+        or metadata["file_count_exposed"] is not True
+        or metadata["file_count"] != len(_UPLOAD_MATERIALS)
+    ):
+        return False
+    expected_families = ["history", "ai_persona", "user_profile", "memory_summary"]
+    if (
+        metadata["source_counts_exposed"] is not True
+        or metadata["source_families"] != expected_families
+    ):
+        return False
+    return True
+
+
 def _decode_private_evidence(raw: bytes, fixture: dict) -> dict:
     try:
         evidence = json.loads(raw.decode("utf-8"))
@@ -1623,6 +2081,19 @@ def _decode_private_evidence(raw: bytes, fixture: dict) -> dict:
         and evidence.get("expected_fact_ids") == expected_fact_ids
         and isinstance(evidence.get("identity"), dict)
         and isinstance(evidence.get("identity_meta"), dict)
+        and set(evidence["identity_meta"])
+        == {"days_with_user", "relationship_started_at"}
+        and type(evidence["identity_meta"]["days_with_user"]) is int
+        and isinstance(evidence["identity_meta"]["relationship_started_at"], str)
+        and _relationship_checks(
+            (
+                fixture.get("relationship")
+                if isinstance(fixture.get("relationship"), dict)
+                else {}
+            ),
+            evidence["identity_meta"],
+        )
+        == (True, True)
         and isinstance(evidence.get("persona_text"), str)
         and isinstance(evidence.get("memories"), list)
         and isinstance(evidence.get("greeting_messages"), list)
@@ -1632,13 +2103,15 @@ def _decode_private_evidence(raw: bytes, fixture: dict) -> dict:
         and isinstance(evidence.get("capture_checks"), dict)
         and set(evidence["capture_checks"])
         == {
+            "archive_receipts_verified",
+            "genesis_upload_metadata_verified",
             "identity_envelope_decrypted",
             "persona_envelope_decrypted",
             "memory_envelopes_decrypted",
             "chat_envelopes_decrypted",
         }
         and all(type(value) is bool for value in evidence["capture_checks"].values())
-        and isinstance(evidence.get("transport"), dict)
+        and _valid_existing_session_transport(evidence.get("transport"), fixture)
     )
     if not valid:
         raise ExistingSessionDistillError(

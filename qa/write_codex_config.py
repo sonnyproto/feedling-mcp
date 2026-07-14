@@ -21,9 +21,12 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:
-    from qa.orchestration_contract import PROFILE_AGENT_TYPES
+    from qa.orchestration_contract import (
+        MEMORY_CONTRACT_PROFILE_ID,
+        PROFILE_AGENT_TYPES,
+    )
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
-    from orchestration_contract import PROFILE_AGENT_TYPES
+    from orchestration_contract import MEMORY_CONTRACT_PROFILE_ID, PROFILE_AGENT_TYPES
 
 
 SUPERVISOR_PERMISSION_PROFILE = "feedling-e2e-supervisor"
@@ -201,7 +204,9 @@ def _permission_header(profile: str, description: str) -> list[str]:
     ]
 
 
-def _network_lines(profile: str, host: str) -> list[str]:
+def _network_lines(
+    profile: str, host: str, *, allow_local_binding: bool = False
+) -> list[str]:
     key = _quoted(profile)
     return [
         "",
@@ -213,7 +218,7 @@ def _network_lines(profile: str, host: str) -> list[str]:
         "allow_upstream_proxy = false",
         "dangerously_allow_non_loopback_proxy = false",
         "dangerously_allow_all_unix_sockets = false",
-        "allow_local_binding = false",
+        f"allow_local_binding = {'true' if allow_local_binding else 'false'}",
         "",
         f"[permissions.{key}.network.domains]",
         f'{_quoted(host)} = "allow"',
@@ -383,6 +388,7 @@ def build_config_bundle(
     worker_python: Path,
     qualification_mode: str = "release",
     runtime_read_roots: Sequence[Path] = (),
+    allow_local_binding: bool = False,
 ) -> CodexConfigBundle:
     codex_home = _private_directory(output.parent, "CODEX_HOME")
     destination = _future_file(output, "Codex config", private_parent=True)
@@ -393,6 +399,11 @@ def build_config_bundle(
     )
     provisioning = _future_file(
         full_manifest, "full provisioning manifest", private_parent=True
+    )
+    memory_manifest = _future_file(
+        manifests / f"{MEMORY_CONTRACT_PROFILE_ID}.json",
+        "memory contract manifest",
+        private_parent=True,
     )
     root_home = _private_directory(supervisor_home, "supervisor home")
     root_tmp = _private_directory(supervisor_tmp, "supervisor temp")
@@ -413,6 +424,8 @@ def build_config_bundle(
 
     if qualification_mode not in {"release", "diagnostic"}:
         raise CodexConfigError("qualification mode is invalid")
+    if type(allow_local_binding) is not bool:
+        raise CodexConfigError("allow-local-binding must be a boolean")
     if destination.parent != codex_home:
         raise CodexConfigError("Codex config must be directly beneath CODEX_HOME")
     if qualification_mode == "release" and not _contains(source, artifacts):
@@ -450,7 +463,9 @@ def build_config_bundle(
         or any(_contains(private, receipt) for private in top_level_private)
     ):
         raise CodexConfigError("orchestration receipt path is not isolated")
-    _reject_ambient_readable((*top_level_private, artifacts, provisioning, receipt))
+    _reject_ambient_readable(
+        (*top_level_private, artifacts, provisioning, memory_manifest, receipt)
+    )
     if any(
         _contains(private, runtime) or _contains(runtime, private)
         for runtime in runtimes
@@ -548,7 +563,13 @@ def build_config_bundle(
     lines.extend(
         f"{_quoted(path)} = {_quoted(access)}" for path, access in supervisor_filesystem
     )
-    lines.extend(_network_lines(SUPERVISOR_PERMISSION_PROFILE, host))
+    lines.extend(
+        _network_lines(
+            SUPERVISOR_PERMISSION_PROFILE,
+            host,
+            allow_local_binding=allow_local_binding,
+        )
+    )
 
     for profile_id, agent_type in PROFILE_AGENT_TYPES:
         permission = worker_permission_profile(profile_id)
@@ -561,6 +582,7 @@ def build_config_bundle(
             (str(source), "read"),
             (str(artifacts), "deny"),
             (str(provisioning), "deny"),
+            (str(memory_manifest), "deny"),
             (str(manifest_paths[profile_id]), "read"),
             (str(worker_outputs), "deny"),
             (str(aggregation_inputs), "deny"),
@@ -583,7 +605,13 @@ def build_config_bundle(
         lines.extend(
             f"{_quoted(path)} = {_quoted(access)}" for path, access in filesystem
         )
-        lines.extend(_network_lines(permission, host))
+        lines.extend(
+            _network_lines(
+                permission,
+                host,
+                allow_local_binding=allow_local_binding,
+            )
+        )
 
     return CodexConfigBundle(main="\n".join(lines), profiles=profile_configs)
 
@@ -661,6 +689,15 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional trusted interpreter/dependency root (repeatable)",
     )
+    parser.add_argument(
+        "--allow-local-binding",
+        action="store_true",
+        help=(
+            "Allow the exact DNS host to resolve to a local/non-public address. "
+            "Intended only for explicitly diagnosed local fake-IP proxies; CI "
+            "and release qualification must leave this disabled."
+        ),
+    )
     return parser
 
 
@@ -685,6 +722,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             worker_python=args.worker_python,
             qualification_mode=args.qualification_mode,
             runtime_read_roots=args.runtime_read_root,
+            allow_local_binding=args.allow_local_binding,
         )
         write_bundle(args.output, bundle)
     except CodexConfigError as exc:

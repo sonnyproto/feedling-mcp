@@ -20,3 +20,5 @@ PROFILE_TO_AGENT_TYPE = dict(PROFILE_AGENT_TYPES)
 AGENT_TYPE_TO_PROFILE = {
     agent_type: profile_id for profile_id, agent_type in PROFILE_AGENT_TYPES
 }
+
+MEMORY_CONTRACT_PROFILE_ID = "memory-contract"

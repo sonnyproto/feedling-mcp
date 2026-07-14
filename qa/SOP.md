@@ -15,12 +15,19 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 - The system under test MUST be the deployed test endpoint named by
   `QA_FEEDLING_BASE_URL` and the expected deployment named by
   `QA_EXPECTED_DEPLOYMENT_SHA`.
+- Before Codex authentication or synthetic-account provisioning, trusted code
+  MUST read the protected test build identity and prove that its image-baked
+  full source SHA equals both the serialized deploy SHA and
+  `QA_EXPECTED_DEPLOYMENT_SHA`. An operator-supplied label is not evidence.
 - Each synthetic account MUST independently read its authenticated runtime
   status before chat begins. `QA_EXPECTED_RUNTIME=deployed_current` records the
   runtime actually deployed without requiring the future Hosted Runtime V2
   architecture. `QA_EXPECTED_RUNTIME=hosted_resident` is the opt-in strict V2 gate.
 - Use one freshly provisioned synthetic account per profile. Never use a
   customer account.
+- Provision one additional fresh synthetic account exclusively for the
+  deterministic memory contract. Its manifest MUST be unreadable by every
+  profile worker and by the aggregation supervisor.
 - Provider keys and the test admin token are consumed only by the deterministic
   provisioner and deployment-verification steps. They MUST NOT exist in any
   Codex process environment.
@@ -59,15 +66,22 @@ The launcher is not intelligent. It MUST:
    resume, send a follow-up turn, substitute a generic role, or omit a profile.
 4. Capture raw Codex JSON events and stderr only under a private,
    supervisor-denied quarantine root.
-5. Require the trusted Codex event stream to contain a completed, scenario-bound
-   `command_execution` for every agent-driven live scenario P0-02 through
-   P0-11. The command must begin with the exact
-   `QA_SCENARIO_ID=P0-XX ` assignment; one command proves at most one scenario.
+5. For P0-02–P0-05 and P0-07–P0-11, require the trusted Codex event stream to
+   contain the exact scenario/attempt-bound `request_live_scenario_probe.py`
+   command embedded in the worker prompt. A marker alone, an alternate Python
+   command, changed path, shell suffix, failed command, or out-of-order request
+   is not evidence. The helper only requests work: the deterministic parent
+   performs the allowlisted network action and owns
+   `live-scenario-receipts.json`. Validate that receipt set and bind its status,
+   attempts, assertions, identifiers, turns, duplicate/order observations, and
+   latencies to the agent result. Only P0-08–P0-11 may have attempt 2, and only
+   after parent attempt 1 is `AGENT_ERROR` with `CHAT_TIMEOUT` or
+   `MISSING_REPLY`; preserve both attempts.
    P0-01 provisioner/deployment evidence, the parent-owned P0-12 probe, and
    P0-13 cleanup remain independently deterministic. Missing all tool use is
    `AGENT_TOOL_USE_MISSING`; missing scenario-bound commands is
    `AGENT_SCENARIO_TOOL_USE_MISSING`; either is a hard release failure.
-   P0-06 specifically requires exactly three ordered, successful,
+   P0-06 is the semantic exception and specifically requires exactly three ordered, successful,
    phase-specific marker commands: `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, then
    `FINALIZE`. Use the exact commands embedded in the profile-agent prompt.
    Capture and finalize directly invoke the checked-in Genesis tool; review
@@ -117,10 +131,24 @@ exact two-phase existing-session flow:
    `capture_existing_session_distill_evidence(...)`) with its one-row
    `QA_PRIVATE_MANIFEST`, the fixed private evidence path
    `$QA_WORK_ROOT/p0-06-private-evidence.json`, and `QA_ARTIFACT_DIR` as the
-   denied public-artifact boundary. The agent may pass that boundary path to
-   the helper but cannot read or write the directory itself. This imports once,
+   denied public-artifact boundary. The helper loads the four checked-in files
+   declared by the fixture, uploads each exact file once via multipart
+   `POST /v1/onboarding/archive` under one shared `client_job_id`, then submits the
+   same contents and all four locked filename fields to Genesis. It requires four
+   valid `201` upload-acceptance receipts and verifies that each returned storage
+   key is scoped to the authenticated user, returned archive ID, and locked
+   filename. The archive API has no authenticated readback endpoint, so this is
+   deliberately not described as an independent persistence or `client_job_id`
+   readback. Genesis must independently expose the exact shared `client_job_id`,
+   `file_count`, and the complete source-family counts. The stored relationship
+   start must equal the fixture date exactly, and `days_with_user` must match the
+   UTC-derived calendar duration with a one-day timezone tolerance. The agent may
+   pass the artifact-boundary path to the helper
+   but cannot read or write the directory itself. This imports once,
    decrypts the live surfaces, writes a `0600` private evidence file outside
-   public artifacts, and returns its SHA-256.
+   public artifacts, and returns its SHA-256. Public/sanitized evidence contains
+   only bounded archive IDs, filenames, sizes, content hashes, and status codes;
+   it never contains plaintext file content or storage keys.
 2. Read that evidence, make the bounded semantic decisions, and write an exact
    owner-mode `0600` judgment to
    `$QA_WORK_ROOT/p0-06-semantic-judgment.json` whose `evidence_sha256` equals
@@ -202,10 +230,11 @@ Provider credentials are provisioner-only secrets, not agent context.
   real key. A hash or prefix of a key is still forbidden evidence.
 - The provisioner uses a generated, clearly fake value for invalid-key testing.
   The supervisor audits the sanitized receipt; it does not repeat setup.
-- The baseline diagnostic does not use an admin token to select a runtime. The
-  strict V2 release path may use the test admin token only for selecting the
-  synthetic account's runtime, reading it back, deployment identity, reaper,
-  and cleanup controls.
+- Every mode may use the test admin token in deterministic parent code to read
+  the protected build identity. The baseline diagnostic does not use it to
+  select a runtime. The strict V2 release path may additionally use it only for
+  selecting the synthetic account's runtime, reading it back, V2 worker
+  identity, reaper, and cleanup controls.
 - Feedling user API keys and content private keys are in-memory session material.
   They MUST NOT appear in artifacts.
 - The supervisor shell MUST use `feedling-e2e-supervisor`, and each worker MUST
@@ -384,6 +413,46 @@ fallback, late, or out-of-order replies are failures even if another turn passed
 For PASS, every turn also satisfies
 `0 <= acknowledgement_latency <= reply_latency <= 120000` milliseconds.
 
+### Deterministic memory contract
+
+After credential splitting, trusted code MUST run `qa/memory_contract_smoke.py`
+against the dedicated ninth account and write `memory-contract.json` directly
+to the public artifact root. This process receives no provider key, admin token,
+or Codex OAuth material. The receipt contains only fixed check IDs, statuses,
+failure codes, booleans, and bounded counts; it MUST NOT contain account
+credentials, memory IDs, plaintext, ciphertext, or raw responses.
+
+The release gate always requires these live checks to be `PASS/NONE`:
+
+- `fresh_empty_recall`;
+- `encrypted_v1_index_fetch`;
+- `quiet_window_capture_write`, which posts encrypted chat, advances the real
+  quiet-window scheduler, runs the checked-in resident capture executor with a
+  deterministic provider reply, and verifies the new card through index/fetch;
+- `route_chat_message_trace`, which correlates the posted message ID to exactly
+  one deployed `route/chat.message` trace event;
+- `capture_noop_disposable_chitchat`, which completes the native capture job as
+  a no-op and proves that card IDs plus bucket/thread vocabulary do not change;
+- `duplicate_fact_no_growth`, which repeats an already captured fact, supplies
+  the deterministic resolve/no-op decision, and proves that the prior card and
+  vocabulary remain unchanged;
+- `local_only_exclusion`; and
+- `supersede_visibility`.
+
+The two no-growth checks qualify the scheduler, native capture parser/executor,
+encrypted action, terminal-job, and storage behavior for a deterministic agent
+decision. They do not claim that an arbitrary live model will independently
+choose the correct no-op; semantic memory judgment remains in the agent-driven
+profile suite.
+
+`legacy_migration_stable_id` and
+`stale_cas_preserves_concurrent_updates` MUST pass when migration is enabled.
+Under the checked-in `allow_not_exercised_when_disabled` policy, both may instead
+be `NOT_EXERCISED/MIGRATION_DISABLED` only when the deployed kill switch actually
+prevents migration. They are never reported as passing without evidence. A
+missing/malformed receipt, a failed core check, a mixed migration state, or a
+receipt that violates the policy blocks release.
+
 ## 8. Cleanup
 
 Cleanup runs in a `finally` path after evidence capture, regardless of profile
@@ -415,6 +484,7 @@ renderer validates the canonical JSON against the schema and writes the derived 
 
 ```text
 run-result.json
+memory-contract.json
 matrix.md
 latency.csv
 junit.xml
@@ -447,9 +517,11 @@ The overall result is `PASS` only when:
 - all scenario and profile statuses are `PASS`;
 - the observed runtime is present for every profile and, in the strict V2 release
   path, equals `hosted_resident` with the required V2 receipt evidence;
-- pre/post endpoint liveness agrees and, in strict V2 mode, expected and
-  observed deployment identity agree;
+- pre/post endpoint liveness and backend build identity agree with the expected
+  deployment; in strict V2 mode, worker build identity also agrees;
 - every synthetic account is cleaned up;
+- all eight always-required memory checks pass and the two migration checks
+  satisfy the checked-in migration policy;
 - every profile worker has at least one completed qualification-tool execution;
 - every private P0-12 receipt validates, matches its profile result, and proves
   passing reasoning delivery;
@@ -461,9 +533,18 @@ green release gate from partial coverage.
 
 For the local adminless diagnostic only, `QA_QUALIFICATION_MODE=diagnostic`
 moves account reset out of the agent and into the deterministic parent. The
-profile must not call `/v1/account/reset`; it records cleanup as deferred and
-cannot release-pass. This prevents an already-deleted account from becoming an
-unverifiable `401` when the adminless parent performs its mandatory cleanup.
+profile must not call `/v1/account/reset`. P0-13 uses the fixed diagnostic-only
+deferral `BLOCKED_EVIDENCE / CLEANUP / PRECONDITION_MISSING`, with its trace and
+latency assertions true, `cleanup_confirmed=false`, `CLEANUP_FALLBACK_USED`, and
+all top-level cleanup booleans false. When P0-01 through P0-12 pass, the profile
+status is `BLOCKED_EVIDENCE` until the parent finishes. The parent preserves the
+agent artifact, resets the exact manifest accounts, and publishes a separate
+`parent_cleanup_verification` plus `diagnostic_profile_statuses` projection.
+Only an exact cleanup receipt—attempted and cleaned counts equal the selected
+profile count, no failed IDs, manifest deleted, manifest not missing—can turn
+that local projection green. It still cannot release-pass. This prevents an
+already-deleted account from becoming an unverifiable `401` when the adminless
+parent performs its mandatory cleanup.
 
 The deterministic parent MUST NOT grant a local worker read access to the live
 source checkout. It MUST create an owner-only source snapshot, exclude every

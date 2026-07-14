@@ -111,6 +111,21 @@ def _cot_token_evidence(cot: Mapping[str, Any] | None) -> str:
     return "PRESENT" if cot.get("token_metadata_status") == "PRESENT" else "UNVERIFIED"
 
 
+def _parent_finalized_profile_status(
+    summary: Mapping[str, Any], profile_id: str
+) -> str:
+    statuses = summary.get("diagnostic_profile_statuses")
+    cleanup = summary.get("parent_cleanup_verification")
+    if (
+        isinstance(statuses, Mapping)
+        and isinstance(cleanup, Mapping)
+        and cleanup.get("status") == "PASS"
+        and statuses.get(profile_id) == "PASS"
+    ):
+        return "PASS"
+    return "FAIL"
+
+
 def _junit_scenario_status(
     summary: Mapping[str, Any],
     profile_id: str,
@@ -121,6 +136,11 @@ def _junit_scenario_status(
         cot = _cot_row(summary, profile_id)
         if cot is not None and cot.get("status") != "PASS":
             return COT_JUNIT_FAILURE
+    if (
+        scenario_id == "P0-13"
+        and _parent_finalized_profile_status(summary, profile_id) == "PASS"
+    ):
+        return "PASS"
     return scenario_statuses.get(scenario_id, "MISSING")
 
 
@@ -149,6 +169,18 @@ def render_matrix(
     harness = summary.get("qualification_harness")
     if not isinstance(harness, Mapping):
         harness = {}
+    parent_cleanup = summary.get("parent_cleanup_verification")
+    parent_cleanup_status = (
+        parent_cleanup.get("status")
+        if isinstance(parent_cleanup, Mapping)
+        else "UNAVAILABLE"
+    )
+    finalized_statuses = summary.get("diagnostic_profile_statuses")
+    finalized_passes = (
+        sum(value == "PASS" for value in finalized_statuses.values())
+        if isinstance(finalized_statuses, Mapping)
+        else 0
+    )
     lines = [
         "# Feedling local API-key diagnostic",
         "",
@@ -159,6 +191,8 @@ def render_matrix(
         f"- Worker snapshot SHA-256: `{harness.get('worker_snapshot_sha256', 'UNAVAILABLE')}`",
         f"- Harness dirty: `{str(harness.get('dirty', 'UNAVAILABLE')).lower()}`",
         f"- Diagnostic status: `{summary['status']}`",
+        f"- Deterministic parent cleanup: `{parent_cleanup_status}`",
+        f"- Parent-finalized profiles: `{finalized_passes}/{len(profile_ids)}`",
         "- Release qualified: `false`",
         f"- Strict evidence gaps: `{len(summary.get('missing_strict_evidence', []))}`",
         "",

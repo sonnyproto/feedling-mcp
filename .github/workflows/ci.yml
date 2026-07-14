@@ -9,10 +9,24 @@ on:
 
 # Cancel in-progress runs on the same ref — latest push wins.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A push must not cancel a manual qualification after it has provisioned
+  # synthetic users. Manual E2E runs queue on their own stricter environment
+  # lock; ordinary CI runs still use latest-push-wins behavior.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  # This workflow already exists on the default branch. Dispatching it at ref
+  # `test` can therefore invoke the exact reusable E2E workflow from that test
+  # commit before the standalone E2E file itself lands on the default branch.
+  api-key-e2e-manual:
+    name: agentic API-key E2E (manual test-ref dispatch only)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test'
+    uses: ./.github/workflows/api-key-e2e.yml
+    with:
+      runtime_target: deployed_current
+    secrets: inherit
+
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
@@ -124,6 +138,9 @@ jobs:
         run: >-
           python -m pytest
           tests/test_db.py
+          tests/test_memory_contract_backend.py
+          tests/test_qa_build_identity.py
+          tests/test_qa_synthetic_accounts.py
           tests/test_multi_tenant_isolation.py
           tests/test_asgi_cors.py
           tests/openapi/test_public_openapi.py
@@ -752,6 +769,12 @@ jobs:
           # The test admin credential must never equal the production credential.
           FEEDLING_ADMIN_TOKEN: ${{ secrets.TEST_FEEDLING_ADMIN_TOKEN }}
           FEEDLING_ADMIN_PASSWORD: ${{ secrets.TEST_FEEDLING_ADMIN_PASSWORD }}
+          # Test-only synthetic-account lifecycle used by protected qualification.
+          # These values are non-secret and are never wired into production.
+          FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED: "true"
+          FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "14400"
+          FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS: "60"
+          FEEDLING_TEST_DEPLOY_SHA: ${{ github.sha }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
           # TEE 明文影子库双写（feedling-io-db-test 独立 pg CVM）。best-effort
           # 镜像，mirror 永不 raise。两个都空 = OFF。app 角色 DSN、sslmode=require。
@@ -789,6 +812,10 @@ jobs:
             echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
             exit 1
           fi
+          if [ -z "$FEEDLING_ADMIN_TOKEN" ]; then
+            echo "::error::TEST_FEEDLING_ADMIN_TOKEN secret is not set — protected qualification cannot administer synthetic accounts"
+            exit 1
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
@@ -805,6 +832,10 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "FEEDLING_ADMIN_PASSWORD=$FEEDLING_ADMIN_PASSWORD" \
+            -e "FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED=$FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED" \
+            -e "FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS=$FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS" \
+            -e "FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS=$FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS" \
+            -e "FEEDLING_TEST_DEPLOY_SHA=$FEEDLING_TEST_DEPLOY_SHA" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \

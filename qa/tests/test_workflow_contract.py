@@ -17,6 +17,7 @@ def _step(name: str, next_name: str) -> str:
 def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
     assert "workflow_dispatch:" in trigger
+    assert "workflow_call:" in trigger
     assert "push:" not in trigger
     assert "pull_request:" not in trigger
     assert "schedule:" not in trigger
@@ -34,6 +35,29 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     assert (
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in WORKFLOW
     )
+
+
+def test_deployment_target_is_not_operator_supplied_and_resolves_under_lock():
+    trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
+    resolver = _step(
+        "Resolve current serialized test deployment target",
+        "Set up Python",
+    )
+    context = _step(
+        "Prepare isolated run directories",
+        "Verify deployed endpoint and selected runtime target before qualification",
+    )
+
+    assert "expected_deployment_sha:" not in trigger
+    assert "group: feedling-test-environment" in WORKFLOW
+    assert "ref: test" in WORKFLOW
+    assert "fetch-depth: 0" in WORKFLOW
+    assert 'git show "origin/test:deploy/docker-compose.phala.test.yaml"' in resolver
+    assert 'git rev-parse --verify "origin/test^{commit}"' in resolver
+    assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
+    assert "git merge-base --is-ancestor" in resolver
+    assert "steps.deployment_target.outputs.sha" in context
+    assert "inputs.expected_deployment_sha" not in WORKFLOW
 
 
 def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
@@ -76,6 +100,19 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "spawn_agent" not in preflight
     assert "record_codex_subagent_hook" not in preflight
     assert "dangerously-bypass-hook-trust" not in preflight
+
+
+def test_codex_preflight_network_denial_probe_has_balanced_conditionals():
+    preflight = _step(
+        "Install and verify isolated headless Codex runtime",
+        "Provision eight isolated API-key profiles",
+    )
+    start = preflight.index("https://test-api.feedling.app/")
+    end = preflight.index("# Prove the fixed interpreter", start)
+    network_probe = preflight[start:end]
+
+    assert network_probe.count("if curl") == 2
+    assert sum(line.strip() == "fi" for line in network_probe.splitlines()) == 2
 
 
 def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
@@ -147,6 +184,8 @@ def test_manifest_isolation_is_probed_for_all_eight_profiles():
     assert "QA_WORKER_OUTPUT_ROOT" in isolation
     assert "QA_AGGREGATION_INPUT_ROOT" in isolation
     assert "QA_ORCHESTRATION_RECEIPT" in isolation
+    assert "QA_MEMORY_MANIFEST" in isolation
+    assert '--memory-output "${{ steps.context.outputs.memory_manifest }}"' in split
     assert "source-write-must-fail" in isolation
     for profile_id, agent_type in (
         ("official-deepseek", "profile_official_deepseek"),
@@ -330,6 +369,45 @@ def test_agent_result_is_published_and_rendered_only_by_trusted_code():
     assert "--schema qa/schemas/run-result.schema.json" in render
 
 
+def test_memory_contract_uses_isolated_account_and_deterministic_gate_policy():
+    memory = _step(
+        "Run deterministic memory contract on isolated synthetic account",
+        "Verify deployed endpoint and selected runtime target after profile testing",
+    )
+    validate = _step(
+        "Validate complete release result",
+        "Scan public artifacts for secrets and raw evidence",
+    )
+    enforce = WORKFLOW[WORKFLOW.index("      - name: Enforce fail-closed") :]
+
+    assert "qa/memory_contract_smoke.py" in memory
+    assert '--manifest "$QA_MEMORY_MANIFEST"' in memory
+    assert '--output "$QA_MEMORY_RECEIPT"' in memory
+    assert "continue-on-error: true" in memory
+    assert "steps.split_manifests.outcome == 'success'" in memory
+    assert "steps.orchestration.outcome == 'success'" in memory
+    assert WORKFLOW.index(
+        "Verify deployed endpoint and selected runtime target before qualification"
+    ) < WORKFLOW.index(
+        "Run deterministic memory contract on isolated synthetic account"
+    ) < WORKFLOW.index(
+        "Verify deployed endpoint and selected runtime target after profile testing"
+    )
+    for secret_name in (
+        "QA_TEST_ADMIN_TOKEN",
+        "QA_DEEPSEEK_API_KEY",
+        "QA_ANTHROPIC_API_KEY",
+        "QA_OPENAI_PROVIDER_API_KEY",
+        "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+        "QA_CODEX_AUTH_JSON_B64",
+    ):
+        assert secret_name not in memory
+    assert "qa/validate_run.py" in validate
+    assert "MEMORY_CONTRACT" not in enforce
+
+
 def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
     scan = _step(
         "Scan public artifacts for secrets and raw evidence",
@@ -337,6 +415,7 @@ def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
     )
     assert "qa/scan_artifacts.py" in scan
     assert "--manifest" in scan
+    assert "--memory-manifest" in scan
     assert "--codex-auth" in scan
     assert "--fixture qa/fixtures/persona-import-v1.json" in scan
     for secret_name in (

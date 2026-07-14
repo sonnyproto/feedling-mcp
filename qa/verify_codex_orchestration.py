@@ -18,12 +18,22 @@ from typing import Any, BinaryIO, Iterable, Mapping, Sequence
 try:
     from qa.orchestration_contract import PROFILE_AGENT_TYPES
     from qa.validate_cot_receipt import CotReceiptError, validate_cot_receipt
+    from qa.validate_live_scenario_receipts import (
+        LiveScenarioReceiptError,
+        validate_live_scenario_receipts,
+        validate_result_binding as validate_live_result_binding,
+    )
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     from orchestration_contract import PROFILE_AGENT_TYPES
     from validate_cot_receipt import CotReceiptError, validate_cot_receipt
+    from validate_live_scenario_receipts import (
+        LiveScenarioReceiptError,
+        validate_live_scenario_receipts,
+        validate_result_binding as validate_live_result_binding,
+    )
 
 
-RECEIPT_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 4
 MAX_CONFIGURED_CONCURRENCY = 3
 WORKER_FILES = frozenset(
     (
@@ -32,6 +42,7 @@ WORKER_FILES = frozenset(
         "schema.json",
         "stderr.log",
         "cot-delivery-receipt.json",
+        "live-scenario-receipts.json",
     )
 )
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -51,7 +62,9 @@ MANDATORY_SOP_READ_COMMAND = 'sed -n \'1,999p\' "$QA_SOURCE_ROOT/qa/SOP.md"'
 _SCENARIO_COMMAND_RE = re.compile(
     r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[01]))(?:[ \t]|$)"
 )
-_RAW_P0_06_COMMAND_RE = re.compile(r"^QA_SCENARIO_ID=P0-06(?:[ \t]|$)")
+_RAW_SCENARIO_COMMAND_RE = re.compile(
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[01]))(?:[ \t]|$)"
+)
 P0_06_COMMAND_PHASES = ("CAPTURE", "REVIEW", "FINALIZE")
 _CODEX_SHELLS = frozenset(("/bin/bash", "/bin/sh", "/bin/zsh"))
 _SHELL_CONTROL_PUNCTUATION = ";&|<>()"
@@ -98,6 +111,52 @@ _P0_06_FINALIZE_TOKENS = (
     "--artifact-dir",
     "$QA_ARTIFACT_DIR",
 )
+_PARENT_LIVE_SCENARIO_IDS = tuple(
+    scenario_id for scenario_id in AGENT_LIVE_SCENARIO_IDS if scenario_id != "P0-06"
+)
+_RETRYABLE_LIVE_SCENARIO_IDS = frozenset({"P0-08", "P0-09", "P0-10", "P0-11"})
+
+
+def _live_request_tokens(scenario_id: str, attempt: int) -> tuple[str, ...]:
+    return (
+        f"QA_SCENARIO_ID={scenario_id}",
+        "$QA_PYTHON_BIN",
+        "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py",
+        "--scenario",
+        scenario_id,
+        "--attempt",
+        str(attempt),
+        "--request",
+        f"$QA_WORK_ROOT/.live-probe-{scenario_id}-{attempt}.request",
+        "--facts",
+        f"$QA_WORK_ROOT/live-probe-{scenario_id}-{attempt}.facts.json",
+    )
+
+
+def live_request_command(scenario_id: str, attempt: int = 1) -> str:
+    """Return the exact agent-visible command for one parent-owned probe."""
+
+    if (
+        scenario_id not in _PARENT_LIVE_SCENARIO_IDS
+        or attempt not in (1, 2)
+        or (attempt == 2 and scenario_id not in _RETRYABLE_LIVE_SCENARIO_IDS)
+    ):
+        raise ValueError("unsupported live request command")
+    return " ".join(
+        (
+            f"QA_SCENARIO_ID={scenario_id}",
+            '"$QA_PYTHON_BIN"',
+            '"$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py"',
+            "--scenario",
+            scenario_id,
+            "--attempt",
+            str(attempt),
+            "--request",
+            f'"$QA_WORK_ROOT/.live-probe-{scenario_id}-{attempt}.request"',
+            "--facts",
+            f'"$QA_WORK_ROOT/live-probe-{scenario_id}-{attempt}.facts.json"',
+        )
+    )
 
 
 class OrchestrationError(RuntimeError):
@@ -346,11 +405,12 @@ def _p0_06_phase(tokens: tuple[str, ...]) -> str | None:
 def completed_command_evidence(
     path: Path,
 ) -> tuple[int, tuple[str, ...], bool, dict[str, int], tuple[str, ...]]:
-    """Return command count, scenario markers/counts, and first SOP read.
+    """Return fail-closed command evidence without retaining command text.
 
-    Command text is inspected only long enough to recognize a fixed assignment at
-    the start of the command. It is never copied into receipts or public artifacts.
-    One command can therefore prove at most one live scenario.
+    Non-persona scenarios count only when the command exactly invokes the checked-
+    in request helper with its scenario/attempt-bound paths.  Raw anchored marker
+    counts are retained separately so an extra, failed, generic, or composed
+    marker cannot hide beside one valid command.
     """
 
     count = 0
@@ -358,6 +418,10 @@ def completed_command_evidence(
     first_terminal_command: tuple[str, ...] | None = None
     first_terminal_command_succeeded = False
     p0_06_phases: list[str] = []
+    valid_attempts = {
+        scenario_id: [] for scenario_id in _PARENT_LIVE_SCENARIO_IDS
+    }
+    valid_sequence: list[tuple[str, int | str]] = []
     for row in _json_lines(path, "Codex worker event stream"):
         item = row.get("item")
         if not (
@@ -384,11 +448,10 @@ def completed_command_evidence(
             count += 1
         if not isinstance(command, str):
             continue
-        raw_p0_06_marker = bool(
-            _RAW_P0_06_COMMAND_RE.match(_raw_command_payload(command))
-        )
-        if raw_p0_06_marker:
-            scenario_counts["P0-06"] += 1
+        raw_payload = _raw_command_payload(command)
+        raw_match = _RAW_SCENARIO_COMMAND_RE.match(raw_payload)
+        if raw_match:
+            scenario_counts[raw_match.group(1)] += 1
         if item.get("status") != "completed":
             continue
         if not tokens:
@@ -397,10 +460,6 @@ def completed_command_evidence(
         if not match:
             continue
         scenario_id = match.group(1)
-        if scenario_id == "P0-06" and not raw_p0_06_marker:
-            # Defensive fallback for a safely tokenized representation that the
-            # wrapper-only raw accounting did not recognize.
-            scenario_counts[scenario_id] += 1
         if not command_succeeded:
             continue
         if scenario_id == "P0-06":
@@ -408,17 +467,48 @@ def completed_command_evidence(
             if phase is None:
                 continue
             p0_06_phases.append(phase)
-        elif len(tokens) < 3 or tokens[1] != "$QA_PYTHON_BIN":
+            valid_sequence.append((scenario_id, phase))
             continue
-        if scenario_id != "P0-06":
-            scenario_counts[scenario_id] += 1
+        if scenario_id not in _PARENT_LIVE_SCENARIO_IDS:
+            continue
+        matched_attempt = next(
+            (
+                attempt
+                for attempt in (
+                    (1, 2)
+                    if scenario_id in _RETRYABLE_LIVE_SCENARIO_IDS
+                    else (1,)
+                )
+                if tokens == _live_request_tokens(scenario_id, attempt)
+            ),
+            None,
+        )
+        if matched_attempt is None:
+            continue
+        valid_attempts[scenario_id].append(matched_attempt)
+        valid_sequence.append((scenario_id, matched_attempt))
+
+    expected_sequence: list[tuple[str, int | str]] = []
+    valid_ids: list[str] = []
+    for scenario_id in AGENT_LIVE_SCENARIO_IDS:
+        if scenario_id == "P0-06":
+            expected_sequence.extend(
+                (scenario_id, phase) for phase in P0_06_COMMAND_PHASES
+            )
+            if (
+                tuple(p0_06_phases) == P0_06_COMMAND_PHASES
+                and scenario_counts[scenario_id] == len(P0_06_COMMAND_PHASES)
+            ):
+                valid_ids.append(scenario_id)
+            continue
+        attempts = valid_attempts[scenario_id]
+        if attempts in ([1], [1, 2]) and scenario_counts[scenario_id] == len(attempts):
+            valid_ids.append(scenario_id)
+            expected_sequence.extend((scenario_id, attempt) for attempt in attempts)
+    ordered = valid_sequence == expected_sequence
     return (
         count,
-        tuple(
-            scenario_id
-            for scenario_id in AGENT_LIVE_SCENARIO_IDS
-            if scenario_counts[scenario_id] > 0
-        ),
+        tuple(valid_ids) if ordered else (),
         first_terminal_command_succeeded
         and _is_mandatory_sop_read(first_terminal_command or ()),
         scenario_counts,
@@ -440,7 +530,11 @@ def scenario_command_contract_satisfied(
             and (
                 counts[scenario_id] == minimum
                 if scenario_id == "P0-06"
-                else counts[scenario_id] >= minimum
+                else (
+                    minimum <= counts[scenario_id] <= 2
+                    if scenario_id in _RETRYABLE_LIVE_SCENARIO_IDS
+                    else counts[scenario_id] == minimum
+                )
             )
             for scenario_id, minimum in MIN_SCENARIO_COMMAND_COUNTS.items()
         )
@@ -527,6 +621,7 @@ def _validate_receipt_shape(receipt: Any) -> list[dict[str, Any]]:
         "stopped_at",
         "profile_result_sha256",
         "exec_events_sha256",
+        "live_receipt_sha256",
         "cot_receipt_sha256",
         "cot_delivery_status",
         "cot_failure_code",
@@ -552,6 +647,8 @@ def _validate_receipt_shape(receipt: Any) -> list[dict[str, Any]]:
             or not _SHA256_RE.fullmatch(row["profile_result_sha256"])
             or not isinstance(row.get("exec_events_sha256"), str)
             or not _SHA256_RE.fullmatch(row["exec_events_sha256"])
+            or not isinstance(row.get("live_receipt_sha256"), str)
+            or not _SHA256_RE.fullmatch(row["live_receipt_sha256"])
             or not isinstance(row.get("cot_receipt_sha256"), str)
             or not _SHA256_RE.fullmatch(row["cot_receipt_sha256"])
             or row.get("cot_delivery_status") not in {"PASS", "FAIL", "UNVERIFIED"}
@@ -625,6 +722,7 @@ def verify(
         events = directory / "events.jsonl"
         result = directory / "result.json"
         cot_receipt_path = directory / "cot-delivery-receipt.json"
+        live_receipt_path = directory / "live-scenario-receipts.json"
         thread_id, session_id = parse_exec_events(events)
         (
             _,
@@ -663,6 +761,20 @@ def verify(
             raise OrchestrationError(
                 "worker COT evidence does not match trusted receipt"
             )
+        try:
+            live_receipts, live_receipt_sha256 = validate_live_scenario_receipts(
+                live_receipt_path,
+                run_id=str(receipt["launcher_id"]),
+                profile_id=profile_id,
+            )
+        except (LiveScenarioReceiptError, OSError):
+            raise OrchestrationError(
+                "worker live evidence does not match trusted receipt"
+            ) from None
+        if live_receipt_sha256 != row["live_receipt_sha256"]:
+            raise OrchestrationError(
+                "worker live evidence does not match trusted receipt"
+            )
         canonical = aggregation / f"{profile_id}.json"
         result_payload = load_private_json(
             result, "Codex worker result", max_bytes=_MAX_RESULT_BYTES
@@ -679,6 +791,12 @@ def verify(
             )
         if result_payload.get("profile_id") != profile_id:
             raise OrchestrationError("Codex worker result profile is invalid")
+        try:
+            validate_live_result_binding(result_payload, live_receipts)
+        except LiveScenarioReceiptError:
+            raise OrchestrationError(
+                "worker live evidence does not match worker result"
+            ) from None
         # Validate ownership and modes even when their contents are intentionally ignored.
         with open_owned_regular(
             directory / "schema.json",

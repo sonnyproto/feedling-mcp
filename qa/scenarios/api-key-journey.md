@@ -17,13 +17,17 @@ names, evidence codes, identifier minima, and turn counts below. Copy those
 fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
 `attempt_results` row per attempt. A retry never replaces its first observation.
 
-For each agent-driven live scenario P0-02 through P0-11, at least one real probe
-command MUST begin with the exact environment assignment
-`QA_SCENARIO_ID=P0-XX ` for that scenario. The trusted launcher consumes these
-markers from completed Codex events without retaining command text. A comment,
-an uncompleted command, or one command containing several marker strings does
-not prove scenario execution. P0-01, P0-12, and P0-13 have separate
-parent-owned evidence and do not use these markers.
+For P0-02–P0-05 and P0-07–P0-11, run only the exact
+`request_live_scenario_probe.py` command embedded in the worker prompt, with the
+same scenario and attempt in the marker, CLI arguments, request path, and facts
+path. That helper creates a one-shot request; it does not create authoritative
+evidence. The parent performs the fixed live probe, writes a private facts copy
+for agent judgment, and retains the sanitized authoritative receipt. The gate
+binds those receipts to result status, attempts, assertions, identifiers,
+turns, duplicate/order observations, and latency. Only P0-08–P0-11 may retry,
+only after an `AGENT_ERROR` receipt with `CHAT_TIMEOUT` or `MISSING_REPLY`, and
+both attempts must remain visible. P0-01, P0-12, and P0-13 have separate
+parent-owned evidence.
 
 P0-06 is the exception to the one-command minimum: it requires exactly three
 ordered, successful tool calls prefixed with `QA_SCENARIO_ID=P0-06` and distinct
@@ -124,9 +128,23 @@ without reviewing the decrypted evidence surfaces.
 
 **Act**
 
-- On this same account, submit all four material classes from
+- On this same account, load the four authoritative files declared by
   `qa/fixtures/persona-import-v1.json`: chat history, AI persona, personal profile,
-  and memory summary.
+  and memory summary. Before Genesis starts, upload each exact UTF-8 file once as
+  multipart `file` data to `POST /v1/onboarding/archive`, using its locked filename
+  and content type plus one shared `client_job_id`. Require four distinct `201`
+  upload-acceptance receipts, and require each returned storage key to be scoped
+  exactly to the authenticated user, returned archive ID, and locked filename.
+  Evidence may retain the archive ID, filename, byte count, content SHA-256, and a
+  bounded key-scope boolean, but never the returned storage key or plaintext file
+  content. There is no authenticated archive readback endpoint, so do not claim
+  that these receipts independently verify R2 persistence, stored bytes, or the
+  archive-side `client_job_id` index.
+- Submit those same exact file contents to `POST /v1/genesis/imports/plaintext`
+  with `history_filename`, `ai_persona_filename`, `personal_profile_filename`, and
+  `memory_summary_filename` set to the uploaded filenames. Require the job status
+  API to expose the exact shared `client_job_id`, `file_count=4`, and positive history,
+  AI-persona, user-profile, and memory-summary source counts.
 - Use `tools/genesis_e2e.py distill-existing-session` with this profile's
   one-row `QA_PRIVATE_MANIFEST`, the fixed `0600` evidence path
   `$QA_WORK_ROOT/p0-06-private-evidence.json`, and `QA_ARTIFACT_DIR` only as the
@@ -150,16 +168,22 @@ without reviewing the decrypted evidence surfaces.
   scenario's sole `request_id` must equal `persona_finalizer.request_id`, and
   `persona_finalizer` must record fixture `persona-import-v1`, the verified
   lowercase SHA-256, finalizer `job_id`, `semantic_judgment_bound: true`,
-  `finalizer_ok: true`, `private_evidence_deleted: true`, and
-  `privacy_violation_count: 0`. Do not copy this receipt to any other scenario.
+  `finalizer_ok: true`, `private_evidence_deleted: true`,
+  `archive_upload_count: 4`, `archive_receipts_verified: true`,
+  `genesis_upload_metadata_verified: true`, and `privacy_violation_count: 0`.
+  Do not copy this receipt to any other scenario.
 
 **Pass**
 
-- Import finishes once, identity name/category/dimensions/self-introduction are
-  populated, all locked ground-truth facts are represented without duplicates,
-  the relationship anchor exists, the onboarding validator passes, and the
-  privacy-firewall value is absent from identity fields, persona output, and
-  self-introduction.
+- All four literal uploads are accepted with correctly scoped receipt keys; this
+  is upload-acceptance evidence, not an independent archive-persistence readback.
+  The Genesis job independently echoes the exact shared job token; import finishes
+  once; identity
+  name/category/dimensions/self-introduction are populated; all locked
+  ground-truth facts are represented without duplicates; the stored relationship
+  start equals the fixture date and its day count is calendar-consistent within
+  one day for timezone boundaries; the onboarding validator passes; and the privacy-firewall value is
+  absent from identity fields, persona output, and self-introduction.
 
 ## P0-07 — Hosted activation and live-loop verification
 
@@ -332,9 +356,15 @@ Map deterministic delivery failures without inventing evidence:
 - Local adminless diagnostic exception: when
   `QA_QUALIFICATION_MODE=diagnostic`, do not call account reset from the agent.
   The deterministic parent performs the sole reset after collecting the worker
-  result and COT receipt; record the account-reset/old-credential assertions as
-  false and cleanup as deferred. This exception can never produce a release
-  PASS. Provider-config deletion may still be attempted before returning.
+  result and COT receipt. Emit the fixed deferral: P0-13 and its sole attempt are
+  `BLOCKED_EVIDENCE` with `CLEANUP / PRECONDITION_MISSING` and
+  `reproducible=true`; trace stages, correlation, and latency are true while
+  `cleanup_confirmed=false`; evidence includes `TRACE_CORRELATION_CONFIRMED` and
+  `LATENCY_ATTRIBUTED`; top-level cleanup has all four booleans false and status
+  `BLOCKED_EVIDENCE`; diagnostics include `CLEANUP_FALLBACK_USED`. If P0-01
+  through P0-12 pass, top-level profile status is `BLOCKED_EVIDENCE`. The parent
+  preserves this evidence and records cleanup separately. This exception can
+  never produce a release PASS.
 
 **Pass**
 

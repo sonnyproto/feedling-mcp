@@ -342,29 +342,44 @@ def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def get_global_blob_strict(key: str):
+    """Return one global document while preserving database failures.
+
+    Most callers use :func:`get_global_blob`'s historical best-effort behavior.
+    Operational safety checks such as the QA janitor heartbeat must distinguish
+    an absent value from an unavailable database, so they use this strict form.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM global_blobs WHERE key = %s", (key,)
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def get_global_blob(key: str):
     try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                "SELECT doc FROM global_blobs WHERE key = %s", (key,)
-            ).fetchone()
-        return row[0] if row is not None else None
+        return get_global_blob_strict(key)
     except Exception as e:
         log.error("[db] get_global_blob(%s) failed: %s", key, e)
         return None
 
 
-def set_global_blob(key: str, doc) -> None:
+def set_global_blob_strict(key: str, doc) -> None:
+    """Persist one global document while preserving primary-DB failures."""
     sql = ("INSERT INTO global_blobs (key, doc) VALUES (%s, %s) "
            "ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc")
+    params = (key, Jsonb(doc))
+    with get_pool().connection() as conn:
+        conn.execute(sql, params)
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+
+
+def set_global_blob(key: str, doc) -> None:
     try:
-        with get_pool().connection() as conn:
-            conn.execute(sql, (key, Jsonb(doc)))
+        set_global_blob_strict(key, doc)
     except Exception as e:
         log.error("[db] set_global_blob(%s) failed: %s", key, e)
-        return
-    from tee_shadow import mirror
-    mirror.execute(sql, (key, Jsonb(doc)))
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +398,47 @@ def load_all_users() -> list[dict]:
     except Exception as e:
         log.error("[db] load_all_users failed: %s", e)
         return []
+
+
+def load_user_document(user_id: str) -> dict | None:
+    """Return one authoritative user document, or ``None`` when it is absent.
+
+    Unlike ``load_all_users()``, this intentionally lets database errors raise:
+    callers using it as a destructive-operation recheck must distinguish an
+    absent row from an unavailable database.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
+def load_user_documents_with_field(field: str) -> list[tuple[str, dict]]:
+    """Return row identities + object documents containing a top-level field.
+
+    This strict variant is for background janitors: a database outage must fail
+    the tick and retry later, not look indistinguishable from an empty result.
+    Returning the SQL primary key separately prevents a document's mutable
+    ``user_id`` field from redirecting a destructive operation. Non-object JSON
+    is excluded in SQL and guarded again in Python so one malformed row cannot
+    poison every janitor tick.
+    """
+    if not isinstance(field, str) or not field:
+        raise ValueError("field must be a non-empty string")
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id, doc FROM users "
+            "WHERE jsonb_typeof(doc) = 'object' AND doc ? %s "
+            "ORDER BY created_at NULLS FIRST, user_id",
+            (field,),
+        ).fetchall()
+    return [
+        (str(row[0]), row[1])
+        for row in rows
+        if isinstance(row[1], dict)
+    ]
 
 
 def insert_user(entry: dict) -> None:

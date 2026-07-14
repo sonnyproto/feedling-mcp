@@ -62,6 +62,9 @@ def _scenario(scenario_id: str, profile_index: int, all_turns: list[dict]) -> di
             "semantic_judgment_bound": True,
             "finalizer_ok": True,
             "private_evidence_deleted": True,
+            "archive_upload_count": 4,
+            "archive_receipts_verified": True,
+            "genesis_upload_metadata_verified": True,
             "privacy_violation_count": 0,
         }
     return {
@@ -231,6 +234,175 @@ def _valid_result() -> dict:
     }
 
 
+def _memory_receipt(*, migration_disabled: bool = False) -> dict:
+    checks = [
+        {
+            "id": "fresh_empty_recall",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "index_count": 0,
+                "fetch_count": 0,
+                "missing_count": 1,
+            },
+        },
+        {
+            "id": "encrypted_v1_index_fetch",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "stored_record_count": 1,
+                "index_count": 1,
+                "fetch_count": 1,
+                "encrypted_at_rest": True,
+                "round_trip_verified": True,
+            },
+        },
+        {
+            "id": "quiet_window_capture_write",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "before_card_count": 1,
+                "after_card_count": 2,
+                "capture_job_count": 1,
+                "cards_added": 1,
+                "cards_superseded": 0,
+                "quiet_window_enqueued": True,
+                "capture_noop": False,
+                "fetch_count": 1,
+                "round_trip_verified": True,
+            },
+        },
+        {
+            "id": "route_chat_message_trace",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "route_event_count": 1,
+                "route_event_correlated": True,
+            },
+        },
+        {
+            "id": "capture_noop_disposable_chitchat",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "before_card_count": 2,
+                "after_card_count": 2,
+                "capture_job_count": 1,
+                "cards_added": 0,
+                "cards_superseded": 0,
+                "quiet_window_enqueued": True,
+                "capture_noop": True,
+                "bucket_vocab_unchanged": True,
+                "thread_vocab_unchanged": True,
+            },
+        },
+        {
+            "id": "duplicate_fact_no_growth",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "before_card_count": 2,
+                "after_card_count": 2,
+                "capture_job_count": 1,
+                "cards_added": 0,
+                "cards_superseded": 0,
+                "quiet_window_enqueued": True,
+                "capture_noop": True,
+                "fetch_count": 1,
+                "bucket_vocab_unchanged": True,
+                "thread_vocab_unchanged": True,
+                "existing_card_preserved": True,
+            },
+        },
+        {
+            "id": "local_only_exclusion",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "index_count": 0,
+                "fetch_count": 0,
+                "unavailable_count": 1,
+                "local_only_excluded": True,
+            },
+        },
+        {
+            "id": "supersede_visibility",
+            "layer": "live_api",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "default_visible_count": 1,
+                "explicit_visible_count": 1,
+                "unavailable_count": 1,
+                "superseded_hidden_by_default": True,
+                "replacement_visible": True,
+            },
+        },
+        {
+            "id": "legacy_migration_stable_id",
+            "layer": "deployed_backend_contract",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "fetch_count": 1,
+                "stable_id_preserved": True,
+                "legacy_shape_removed": True,
+                "round_trip_verified": True,
+            },
+        },
+        {
+            "id": "stale_cas_preserves_concurrent_updates",
+            "layer": "deployed_backend_contract",
+            "status": "PASS",
+            "failure_code": "NONE",
+            "observations": {
+                "fetch_count": 2,
+                "stable_id_preserved": True,
+                "stale_write_rejected": True,
+                "winning_update_preserved": True,
+                "concurrent_card_preserved": True,
+            },
+        },
+    ]
+    if migration_disabled:
+        for check in checks[-2:]:
+            check.update(
+                status="NOT_EXERCISED",
+                failure_code="MIGRATION_DISABLED",
+                observations={},
+            )
+    return {
+        "schema_version": 1,
+        "kind": "memory_contract_smoke",
+        "profile_id": gate.MEMORY_CONTRACT_PROFILE_ID,
+        "target": "test",
+        "account_lifecycle": "externally_managed",
+        "status": "UNVERIFIED" if migration_disabled else "PASS",
+        "failure_code": "MIGRATION_DISABLED" if migration_disabled else "NONE",
+        "release_qualified": False,
+        "checks": checks,
+        "summary": {
+            "pass": 8 if migration_disabled else 10,
+            "fail": 0,
+            "not_exercised": 2 if migration_disabled else 0,
+            "not_run": 0,
+        },
+        "sensitive_data_persisted": False,
+        "raw_responses_persisted": False,
+        "raw_memory_ids_persisted": False,
+    }
+
+
 def _write_run(tmp_path: Path, result: dict | None = None) -> tuple[Path, Path]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
@@ -243,6 +415,7 @@ def _write_run(tmp_path: Path, result: dict | None = None) -> tuple[Path, Path]:
         (profiles / f"{profile_id}.json").write_text("{}\n")
     result_path = artifacts / "run-result.json"
     result_path.write_text(json.dumps(_valid_result() if result is None else result))
+    (artifacts / gate.MEMORY_CONTRACT_RECEIPT).write_text(json.dumps(_memory_receipt()))
     return artifacts, result_path
 
 
@@ -256,6 +429,7 @@ def _write_receipt(
         "expected_runtime": "hosted_resident",
         "expected_deployment_sha": SHA,
         "observed_backend_sha": SHA,
+        "observed_deployment_sha": SHA,
         "observed_worker_sha": SHA,
         "live_worker_count": 2,
         "liveness_verified": True,
@@ -281,10 +455,13 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
         "runtime_mode": "hosted_resident",
         "synthetic_account_reaper": {
             "enabled": True,
+            "ready": True,
+            "heartbeat_fresh": True,
             "label_prefix": "agent-e2e-",
             "max_ttl_seconds": 14_400,
         },
         "profiles": [],
+        "auxiliary_accounts": [],
     }
     for profile in result["profiles"]:
         profile_id = profile["profile_id"]
@@ -303,6 +480,13 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "api_key": f"private-account-key-{profile_id}",
                 "secret_key_b64": "cHJpdmF0ZS1zZWNyZXQta2V5",
                 "public_key_b64": "cHJpdmF0ZS1wdWJsaWMta2V5",
+                "synthetic_account_lease": {
+                    "registered": True,
+                    "lease_id": "lease_" + "a" * 32,
+                    "expires_at": "2026-07-13T15:58:00+00:00",
+                    "expires_at_epoch": 1_783_958_280,
+                    "ttl_seconds": 14_400,
+                },
                 "trace_enabled": True,
                 "runtime_mode": "hosted_resident",
                 "runtime_version": 2,
@@ -332,6 +516,28 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "runtime_mode_readback_verified": True,
             }
         )
+    manifest["auxiliary_accounts"].append(
+        {
+            "profile_id": gate.MEMORY_CONTRACT_PROFILE_ID,
+            "purpose": "deterministic_memory_contract",
+            "label": (
+                f"agent-e2e-{result['run_id']}-{gate.MEMORY_CONTRACT_PROFILE_ID}"
+            ),
+            "user_id": "synthetic-memory-user",
+            "api_key": "private-account-key-memory-contract",
+            "secret_key_b64": "cHJpdmF0ZS1tZW1vcnktc2VjcmV0LWtleQ==",
+            "public_key_b64": "cHJpdmF0ZS1tZW1vcnktcHVibGljLWtleQ==",
+            "provision_status": "ready",
+            "provision_failure_code": "NONE",
+            "synthetic_account_lease": {
+                "registered": True,
+                "lease_id": "lease_" + "b" * 32,
+                "expires_at": "2026-07-13T15:58:00+00:00",
+                "expires_at_epoch": 1_783_958_280,
+                "ttl_seconds": 14_400,
+            },
+        }
+    )
     path = tmp_path / "provisioning-manifest.json"
     path.write_text(json.dumps(manifest))
     path.chmod(0o600)
@@ -429,11 +635,84 @@ def test_valid_release_artifacts_pass(tmp_path):
     assert _validate(tmp_path) == []
 
 
-def test_baseline_release_accepts_observed_runtime_without_v2_identity(tmp_path):
+def test_memory_contract_receipt_accepts_all_checks_passed():
+    assert gate._validate_memory_contract_receipt(_memory_receipt()) == []
+
+
+def test_memory_contract_receipt_accepts_disabled_migration_only_under_policy():
+    receipt = _memory_receipt(migration_disabled=True)
+
+    assert gate._validate_memory_contract_receipt(receipt) == []
+    assert gate._validate_memory_contract_receipt(
+        receipt,
+        migration_policy=gate.MEMORY_MIGRATION_REQUIRED,
+    ) == ["memory migration contract did not satisfy the release policy"]
+
+
+def test_memory_contract_core_failure_blocks_release():
+    receipt = _memory_receipt()
+    receipt.update(status="FAIL", failure_code="FRESH_ACCOUNT_NOT_EMPTY")
+    receipt["checks"][0].update(
+        status="FAIL",
+        failure_code="FRESH_ACCOUNT_NOT_EMPTY",
+        observations={},
+    )
+    receipt["summary"].update({"pass": 9, "fail": 1})
+
+    assert gate._validate_memory_contract_receipt(receipt) == [
+        "memory contract core live checks did not all pass"
+    ]
+
+
+def test_missing_memory_contract_receipt_fails_closed(tmp_path):
+    artifacts, result_path = _write_run(tmp_path)
+    (artifacts / gate.MEMORY_CONTRACT_RECEIPT).unlink()
+    qa_dir = Path(__file__).resolve().parents[1]
+
+    with pytest.raises(gate.GateInputError, match="memory contract receipt"):
+        gate.validate_release(
+            coverage_path=qa_dir / "coverage-lock.json",
+            schema_path=qa_dir / "schemas" / "run-result.schema.json",
+            result_path=result_path,
+            artifacts_path=artifacts,
+            provisioning_manifest_path=_write_provisioning_manifest(tmp_path),
+            orchestration_receipt_path=_write_orchestration_receipt(tmp_path),
+            deployment_receipt_path=_write_receipt(tmp_path),
+            post_deployment_receipt_path=_write_receipt(
+                tmp_path, "post-deployment-receipt.json"
+            ),
+            expected_runtime="hosted_resident",
+            expected_sha=SHA,
+        )
+
+
+@pytest.mark.parametrize("tamper", ("missing", "provider_user", "invalid_lease"))
+def test_provisioning_manifest_requires_isolated_memory_account(tmp_path, tamper):
+    manifest_path = _write_provisioning_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    if tamper == "missing":
+        manifest["auxiliary_accounts"] = []
+    elif tamper == "provider_user":
+        manifest["auxiliary_accounts"][0]["user_id"] = manifest["profiles"][0][
+            "user_id"
+        ]
+    else:
+        manifest["auxiliary_accounts"][0]["synthetic_account_lease"][
+            "registered"
+        ] = False
+    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.chmod(0o600)
+
+    errors = _validate(tmp_path, manifest_path=manifest_path)
+
+    assert any("memory account" in error for error in errors)
+
+
+def test_baseline_release_accepts_backend_identity_without_v2_worker_identity(tmp_path):
     result = _valid_result()
     result["target"].update(
         expected_runtime="deployed_current",
-        observed_backend_sha=None,
+        observed_backend_sha=SHA,
         observed_worker_sha=None,
     )
     for profile in result["profiles"]:
@@ -464,11 +743,12 @@ def test_baseline_release_accepts_observed_runtime_without_v2_identity(tmp_path)
 
     baseline_receipt = {
         "expected_runtime": "deployed_current",
-        "observed_backend_sha": None,
+        "observed_backend_sha": SHA,
+        "observed_deployment_sha": SHA,
         "observed_worker_sha": None,
         "live_worker_count": None,
         "liveness_verified": True,
-        "deployment_identity_verified": False,
+        "deployment_identity_verified": True,
     }
     pre_receipt = _write_receipt(tmp_path, **baseline_receipt)
     post_receipt = _write_receipt(
@@ -478,9 +758,7 @@ def test_baseline_release_accepts_observed_runtime_without_v2_identity(tmp_path)
     errors = gate.validate_release(
         coverage_path=Path(__file__).resolve().parents[1] / "coverage-lock.json",
         schema_path=(
-            Path(__file__).resolve().parents[1]
-            / "schemas"
-            / "run-result.schema.json"
+            Path(__file__).resolve().parents[1] / "schemas" / "run-result.schema.json"
         ),
         result_path=result_path,
         artifacts_path=artifacts,
@@ -546,6 +824,9 @@ def test_result_target_must_be_the_exact_test_origin(tmp_path):
         lambda coverage: coverage["target"].update(base_url_env="UNLOCKED_BASE_URL"),
         lambda coverage: coverage["reasoning_contract"].update(
             raw_private_chain_of_thought_forbidden=False
+        ),
+        lambda coverage: coverage["deterministic_contracts"]["memory"].update(
+            migration_policy="optional_without_evidence"
         ),
         lambda coverage: coverage["artifact_contract"].update(required=[]),
         lambda coverage: coverage["execution"].update(max_profile_concurrency=4),
@@ -668,6 +949,9 @@ def test_semantic_evidence_is_fail_closed(tmp_path, mutate, expected):
         lambda receipt: receipt.update(semantic_judgment_bound=False),
         lambda receipt: receipt.update(finalizer_ok=False),
         lambda receipt: receipt.update(private_evidence_deleted=False),
+        lambda receipt: receipt.update(archive_upload_count=3),
+        lambda receipt: receipt.update(archive_receipts_verified=False),
+        lambda receipt: receipt.update(genesis_upload_metadata_verified=False),
         lambda receipt: receipt.update(privacy_violation_count=1),
     ],
 )
@@ -1086,9 +1370,7 @@ def test_agent_peak_must_match_trusted_process_receipt(tmp_path):
             "content binding is invalid",
         ),
         (
-            lambda receipt: receipt["workers"][0].update(
-                cot_receipt_sha256="A" * 64
-            ),
+            lambda receipt: receipt["workers"][0].update(cot_receipt_sha256="A" * 64),
             "content binding is invalid",
         ),
         (
@@ -1360,6 +1642,43 @@ def test_trusted_deployment_receipt_must_match_candidate_and_result(tmp_path):
     assert "agent result deployment identity differs from the pre-run receipt" in errors
 
 
+def test_trusted_deployment_receipt_requires_matching_injected_deploy_sha(tmp_path):
+    artifacts, result_path = _write_run(tmp_path, _valid_result())
+    receipt = _write_receipt(tmp_path, observed_deployment_sha="b" * 40)
+    qa_dir = Path(__file__).resolve().parents[1]
+
+    errors = gate.validate_release(
+        coverage_path=qa_dir / "coverage-lock.json",
+        schema_path=qa_dir / "schemas" / "run-result.schema.json",
+        result_path=result_path,
+        artifacts_path=artifacts,
+        provisioning_manifest_path=_write_provisioning_manifest(tmp_path),
+        orchestration_receipt_path=_write_orchestration_receipt(tmp_path),
+        deployment_receipt_path=receipt,
+        post_deployment_receipt_path=_write_receipt(
+            tmp_path, "post-deployment-receipt.json"
+        ),
+        expected_runtime="hosted_resident",
+        expected_sha=SHA,
+    )
+
+    assert "pre-run trusted deployment receipt does not match the candidate" in errors
+    assert "deployment identity changed during the qualification run" in errors
+
+
+def test_baseline_result_still_requires_authoritative_backend_sha():
+    result = _valid_result()
+    result["target"].update(
+        expected_runtime="deployed_current",
+        observed_backend_sha=None,
+        observed_worker_sha=None,
+    )
+
+    errors = gate._validate_result_semantics(result, "deployed_current", SHA)
+
+    assert "observed backend SHA does not match the expected deployment" in errors
+
+
 def test_trusted_provisioning_manifest_binds_model_user_and_reasoning_route(tmp_path):
     result = _valid_result()
     profile = result["profiles"][0]
@@ -1385,6 +1704,46 @@ def test_trusted_provisioning_manifest_blocked_profile_cannot_release(tmp_path):
     assert (
         "profile official-deepseek trusted provisioning receipt is incomplete" in errors
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("registered", False),
+        ("lease_id", "forged"),
+        ("expires_at_epoch", True),
+        ("ttl_seconds", 60),
+    ),
+)
+def test_trusted_provisioning_manifest_requires_server_lease_receipt(
+    tmp_path, field, value
+):
+    manifest_path = _write_provisioning_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["profiles"][0]["synthetic_account_lease"][field] = value
+    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.chmod(0o600)
+
+    errors = _validate(tmp_path, _valid_result(), manifest_path=manifest_path)
+
+    assert (
+        "profile official-deepseek trusted provisioning receipt is incomplete" in errors
+    )
+
+
+@pytest.mark.parametrize("field", ("ready", "heartbeat_fresh"))
+def test_trusted_provisioning_manifest_requires_operational_reaper_health(
+    tmp_path, field
+):
+    manifest_path = _write_provisioning_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["synthetic_account_reaper"][field] = False
+    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.chmod(0o600)
+
+    errors = _validate(tmp_path, _valid_result(), manifest_path=manifest_path)
+
+    assert "trusted provisioning manifest lacks a safe synthetic-account reaper" in errors
 
 
 def test_trusted_provisioning_manifest_rejects_swapped_openrouter_model_families(

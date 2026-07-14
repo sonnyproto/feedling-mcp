@@ -31,7 +31,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tools.provider_smoke import crypto  # noqa: E402
 from tools.provider_smoke.client import Session, SmokeClient  # noqa: E402
+
+try:
+    from qa.orchestration_contract import MEMORY_CONTRACT_PROFILE_ID
+except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
+    from orchestration_contract import MEMORY_CONTRACT_PROFILE_ID
 
 
 ALLOWED_BASE_URL = "https://test-api.feedling.app"
@@ -50,7 +56,9 @@ INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
 MANIFEST_SCHEMA_VERSION = 1
 SYNTHETIC_LABEL_PREFIX = "agent-e2e-"
 SYNTHETIC_REAPER_PATH = "/v1/admin/qa/synthetic-account-reaper"
+SYNTHETIC_REGISTRATION_PATH = "/v1/admin/qa/synthetic-accounts/register"
 MAX_SYNTHETIC_TTL_SECONDS = 14_400
+_SYNTHETIC_LEASE_RE = re.compile(r"^lease_[0-9a-f]{32}$")
 PROVISION_STATUS_READY = "ready"
 PROVISION_STATUS_BLOCKED = "blocked"
 PROVISION_FAILURE_NONE = "NONE"
@@ -490,8 +498,15 @@ class AdminClient:
         )
 
     def request(
-        self, method: str, path: str, body: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        attempts: int = 5,
     ) -> tuple[int, dict]:
+        if type(attempts) is not int or not 1 <= attempts <= 5:
+            raise ValueError("attempts must be an integer between 1 and 5")
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -499,7 +514,7 @@ class AdminClient:
             headers={"Content-Type": "application/json", "X-Admin-Token": self._token},
             method=method,
         )
-        for attempt in range(5):
+        for attempt in range(attempts):
             try:
                 with self._opener.open(request, timeout=45) as response:
                     return response.status, json.loads(response.read() or b"{}")
@@ -516,9 +531,64 @@ class AdminClient:
                 ConnectionError,
                 OSError,
             ):
-                if attempt < 4:
+                if attempt < attempts - 1:
                     time.sleep(2.0 * (attempt + 1))
         raise ProvisionError("admin endpoint was unreachable") from None
+
+    def register_synthetic(
+        self, label: str, *, ttl_seconds: int
+    ) -> tuple[Session, dict[str, Any]]:
+        """Create one server-marked account while keeping its private key local."""
+
+        sk, pk = crypto.generate_keypair()
+        try:
+            status, body = self.request(
+                "POST",
+                SYNTHETIC_REGISTRATION_PATH,
+                {
+                    "public_key": base64.b64encode(pk).decode("ascii"),
+                    "access_mode": "model_api",
+                    "label": label,
+                    "ttl_seconds": ttl_seconds,
+                },
+                # This endpoint is deliberately non-idempotent. A lost response
+                # may mean the server already committed an account; retrying
+                # would create a second inaccessible lease until the TTL reaper.
+                attempts=1,
+            )
+        except Exception:
+            raise ProvisionError("synthetic account registration failed") from None
+        response_body = body if isinstance(body, Mapping) else {}
+        user_id = response_body.get("user_id")
+        api_key = response_body.get("api_key")
+        lease_id = response_body.get("lease_id")
+        expires_at = response_body.get("expires_at")
+        expires_at_epoch = response_body.get("expires_at_epoch")
+        if (
+            status != 201
+            or not isinstance(user_id, str)
+            or not user_id
+            or not isinstance(api_key, str)
+            or not api_key
+            or response_body.get("label") != label
+            or not isinstance(lease_id, str)
+            or _SYNTHETIC_LEASE_RE.fullmatch(lease_id) is None
+            or not isinstance(expires_at, str)
+            or not expires_at
+            or type(expires_at_epoch) is not int
+            or expires_at_epoch <= int(time.time())
+        ):
+            raise ProvisionError("synthetic account registration receipt is invalid")
+        return (
+            Session(user_id=user_id, api_key=api_key, sk=sk, pk=pk),
+            {
+                "registered": True,
+                "lease_id": lease_id,
+                "expires_at": expires_at,
+                "expires_at_epoch": expires_at_epoch,
+                "ttl_seconds": ttl_seconds,
+            },
+        )
 
 
 def _manifest_entry(
@@ -532,6 +602,7 @@ def _manifest_entry(
     *,
     diagnostic: bool = False,
     runtime_requirement: str = RUNTIME_V2_REQUIREMENT,
+    synthetic_lease: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     entry = {
         "profile_id": profile["profile_id"],
@@ -562,6 +633,9 @@ def _manifest_entry(
         "runtime_mode_readback_verified": False,
         "provision_status": PROVISION_STATUS_BLOCKED,
         "provision_failure_code": PROVISION_FAILURE_INCOMPLETE,
+        "synthetic_account_lease": (
+            None if synthetic_lease is None else dict(synthetic_lease)
+        ),
     }
     if diagnostic:
         entry.update(
@@ -570,6 +644,23 @@ def _manifest_entry(
             }
         )
     return entry
+
+
+def _memory_contract_entry(
+    session: Session, label: str, synthetic_lease: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "profile_id": MEMORY_CONTRACT_PROFILE_ID,
+        "purpose": "deterministic_memory_contract",
+        "label": label,
+        "user_id": session.user_id,
+        "api_key": session.api_key,
+        "secret_key_b64": base64.b64encode(session.sk).decode("ascii"),
+        "public_key_b64": base64.b64encode(session.pk).decode("ascii"),
+        "provision_status": PROVISION_STATUS_READY,
+        "provision_failure_code": PROVISION_FAILURE_NONE,
+        "synthetic_account_lease": dict(synthetic_lease),
+    }
 
 
 def _verify_synthetic_reaper(admin_client: AdminClient) -> dict[str, Any]:
@@ -581,6 +672,8 @@ def _verify_synthetic_reaper(admin_client: AdminClient) -> dict[str, Any]:
         status != 200
         or not isinstance(body, dict)
         or body.get("enabled") is not True
+        or body.get("ready") is not True
+        or body.get("heartbeat_fresh") is not True
         or body.get("label_prefix") != SYNTHETIC_LABEL_PREFIX
         or not isinstance(body.get("max_ttl_seconds"), int)
         or isinstance(body.get("max_ttl_seconds"), bool)
@@ -589,6 +682,8 @@ def _verify_synthetic_reaper(admin_client: AdminClient) -> dict[str, Any]:
         raise ProvisionError("synthetic-account reaper is not safely configured")
     return {
         "enabled": True,
+        "ready": True,
+        "heartbeat_fresh": True,
         "label_prefix": SYNTHETIC_LABEL_PREFIX,
         "max_ttl_seconds": body["max_ttl_seconds"],
     }
@@ -868,7 +963,30 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
             for field in ("user_id", "api_key", "secret_key_b64", "public_key_b64")
         ):
             return False
-    return True
+    auxiliary = manifest.get("auxiliary_accounts")
+    if manifest.get("qualification_mode") == QUALIFICATION_MODE_DIAGNOSTIC:
+        return auxiliary == []
+    if not isinstance(auxiliary, list) or len(auxiliary) != 1:
+        return False
+    memory = auxiliary[0]
+    return (
+        isinstance(memory, Mapping)
+        and memory.get("profile_id") == MEMORY_CONTRACT_PROFILE_ID
+        and memory.get("purpose") == "deterministic_memory_contract"
+        and memory.get("provision_status") == PROVISION_STATUS_READY
+        and memory.get("provision_failure_code") == PROVISION_FAILURE_NONE
+        and all(
+            isinstance(memory.get(field), str) and bool(memory.get(field))
+            for field in (
+                "label",
+                "user_id",
+                "api_key",
+                "secret_key_b64",
+                "public_key_b64",
+            )
+        )
+        and isinstance(memory.get("synthetic_account_lease"), Mapping)
+    )
 
 
 def _admin_confirms_user_absent(admin_client: AdminClient | None, user_id: str) -> bool:
@@ -935,9 +1053,11 @@ def cleanup(
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ProvisionError("private manifest schema version is unsupported")
     base_url = validate_base_url(str(manifest.get("base_url") or ""))
-    entries = manifest.get("profiles")
-    if not isinstance(entries, list):
+    profiles = manifest.get("profiles")
+    auxiliary = manifest.get("auxiliary_accounts", [])
+    if not isinstance(profiles, list) or not isinstance(auxiliary, list):
         raise ProvisionError("private manifest has no profiles array")
+    entries = [*profiles, *auxiliary]
     active_client = client or SmokeClient(base_url)
     active_env = os.environ if env is None else env
     verification_admin = admin_client
@@ -1053,6 +1173,7 @@ def provision(
         "runtime_mode": requirement,
         "synthetic_account_reaper": reaper_receipt,
         "profiles": [],
+        "auxiliary_accounts": [],
     }
     if diagnostic:
         manifest.update(
@@ -1077,7 +1198,18 @@ def provision(
             label = f"{SYNTHETIC_LABEL_PREFIX}{run_id}-{profile_id}"
 
             try:
-                session = active_client.register(label)
+                if diagnostic:
+                    session = active_client.register(label)
+                    synthetic_lease = None
+                else:
+                    if active_admin is None:  # pragma: no cover - defensive guard
+                        raise ProvisionError(
+                            "strict provisioning requires admin client"
+                        )
+                    session, synthetic_lease = active_admin.register_synthetic(
+                        label,
+                        ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
+                    )
             except Exception:
                 raise ProvisionError(
                     f"account registration failed for profile: {profile_id}"
@@ -1093,6 +1225,7 @@ def provision(
                     label,
                     diagnostic=diagnostic,
                     runtime_requirement=requirement,
+                    synthetic_lease=synthetic_lease,
                 )
             except Exception:
                 _reset_one(
@@ -1160,6 +1293,28 @@ def provision(
                 entry["provision_failure_code"] = failure.code
                 _atomic_write_manifest(manifest_path, manifest)
                 continue
+        if not diagnostic:
+            if active_admin is None:  # pragma: no cover - defensive guard
+                raise ProvisionError("strict provisioning requires admin client")
+            memory_label = (
+                f"{SYNTHETIC_LABEL_PREFIX}{run_id}-{MEMORY_CONTRACT_PROFILE_ID}"
+            )
+            try:
+                memory_session, memory_lease = active_admin.register_synthetic(
+                    memory_label,
+                    ttl_seconds=int(reaper_receipt["max_ttl_seconds"]),
+                )
+            except Exception:
+                raise ProvisionError("memory contract account registration failed") from None
+            memory_entry = _memory_contract_entry(
+                memory_session, memory_label, memory_lease
+            )
+            manifest["auxiliary_accounts"].append(memory_entry)
+            try:
+                _atomic_write_manifest(manifest_path, manifest)
+            except Exception:
+                _reset_one(active_client, memory_entry, active_admin)
+                raise
         if not _complete_diagnostic_manifest(manifest):
             raise ProvisionError(
                 "provisioning did not produce a complete diagnostic manifest"
@@ -1176,12 +1331,18 @@ def provision(
                 admin_client=active_admin,
             )
             if result["manifest_missing"]:
-                for entry in manifest["profiles"]:
+                for entry in [
+                    *manifest["profiles"],
+                    *manifest["auxiliary_accounts"],
+                ]:
                     _reset_one(active_client, entry, active_admin)
         except Exception:
             # The in-memory checkpoint remains sufficient to attempt cleanup
             # even if the on-disk manifest itself became unreadable.
-            for entry in manifest["profiles"]:
+            for entry in [
+                *manifest["profiles"],
+                *manifest["auxiliary_accounts"],
+            ]:
                 _reset_one(active_client, entry, active_admin)
         raise
 

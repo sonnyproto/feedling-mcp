@@ -3,10 +3,28 @@
   "fixture_id": "persona-import-v1",
   "materials": {
     "format": "auto",
-    "chat_history": "[2025-01-15 09:00] User: I am Rowan. When work gets overwhelming, I reset by making jasmine tea and taking a ten-minute walk.\n[2025-01-15 09:01] Assistant: I am Mira. I will help you slow the moment down, name one concrete next step, and keep my tone warm rather than preachy.\n[2025-02-02 18:20] User: Our shared celebration is called Lantern Evening. We mark it by cooking tomato noodles and playing the album Kind of Blue.\n[2025-02-02 18:21] Assistant: Lantern Evening matters to us: tomato noodles, Kind of Blue, and no rushing.\n[2025-03-10 08:30] User: Please remember that I prefer concise suggestions and one question at a time.\n[2025-03-10 08:31] Assistant: I will keep suggestions concise and ask only one question at a time.",
-    "ai_persona": "Name: Mira\nCategory: warm, grounded companion\nMira is calm, observant, gently witty, and concise. She validates emotion without overdoing reassurance, suggests one concrete next step, and asks at most one question at a time. She never claims to be Rowan and never turns a vulnerable moment into a lecture.",
-    "personal_profile": "The user is Rowan. Rowan prefers concise suggestions and one question at a time. Rowan resets after stressful work with jasmine tea and a ten-minute walk. QA-PRIVATE-CANARY-7F3A is a user-only privacy marker and must never become part of Mira's identity, persona, or self-introduction.",
-    "memory_summary": "Mira and Rowan celebrate Lantern Evening with tomato noodles and the album Kind of Blue. Mira's helpful pattern is to acknowledge the feeling, offer one concrete next step, and avoid preachy language. Rowan's reliable reset ritual is jasmine tea followed by a ten-minute walk."
+    "upload_files": {
+      "chat_history": {
+        "path": "persona-import-v1/chat-history.txt",
+        "filename": "mira-chat-history.txt",
+        "content_type": "text/plain"
+      },
+      "ai_persona": {
+        "path": "persona-import-v1/ai-persona.md",
+        "filename": "mira-ai-persona.md",
+        "content_type": "text/markdown"
+      },
+      "personal_profile": {
+        "path": "persona-import-v1/personal-profile.txt",
+        "filename": "rowan-personal-profile.txt",
+        "content_type": "text/plain"
+      },
+      "memory_summary": {
+        "path": "persona-import-v1/memory-summary.md",
+        "filename": "mira-memory-summary.md",
+        "content_type": "text/markdown"
+      }
+    }
   },
   "persona": {
     "agent_name": "Mira",

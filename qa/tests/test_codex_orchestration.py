@@ -7,13 +7,17 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
 from qa import run_codex_profile_workers as launcher
+from qa import request_live_scenario_probe as live_request
+from qa import validate_diagnostic_attempts as diagnostic_attempts
 from qa import verify_codex_orchestration as verifier
+from qa import validate_live_scenario_receipts as live_receipts
 from qa import write_codex_config as writer
 from qa.orchestration_contract import PROFILE_AGENT_TYPES
 
@@ -137,6 +141,46 @@ def _instance(node: dict[str, Any], definitions: dict[str, Any]) -> Any:
     if node_type == "null":
         return None
     raise AssertionError(node)
+
+
+def _apply_diagnostic_parent_cleanup_deferral(result: dict[str, Any]) -> None:
+    """Make a populated fake worker honest before deterministic cleanup."""
+
+    failure = dict(diagnostic_attempts.PARENT_CLEANUP_DEFERRED_FAILURE)
+    scenario = result["scenarios"][-1]
+    scenario.update(
+        {
+            "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+            "attempts": 1,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+                    "failure": dict(failure),
+                }
+            ],
+            "assertions": {
+                "trace_stages_complete": True,
+                "trace_correlation_confirmed": True,
+                "latency_attributed": True,
+                "cleanup_confirmed": False,
+            },
+            "evidence_codes": [
+                "TRACE_CORRELATION_CONFIRMED",
+                "LATENCY_ATTRIBUTED",
+            ],
+            "failure": failure,
+        }
+    )
+    result["status"] = diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS
+    result["cleanup"] = {
+        "attempted": False,
+        "provider_config_deleted": False,
+        "account_reset": False,
+        "old_credential_rejected": False,
+        "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+    }
+    result["diagnostic_codes"] = ["CLEANUP_FALLBACK_USED"]
 
 
 def _passing_cot_receipt(profile_id: str) -> dict[str, Any]:
@@ -358,6 +402,170 @@ def _cot_probe_runner(mode: str = "valid") -> launcher.CotProbeRunner:
     return run
 
 
+def _passing_live_probe(
+    spec: launcher.WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    nonce: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    turn_count = {
+        "P0-02": 0,
+        "P0-03": 0,
+        "P0-04": 0,
+        "P0-05": 0,
+        "P0-07": 0,
+        "P0-08": 1,
+        "P0-09": 10,
+        "P0-10": 2,
+        "P0-11": 1,
+    }[scenario_id]
+    semantic = scenario_id in {"P0-10", "P0-11"}
+    turns = [
+        {
+            "turn_index": index,
+            "request_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+            "turn_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+            "trace_id": f"req-{scenario_id.lower()}-{attempt}-{index}",
+            "ack_latency_ms": float(index * 10),
+            "reply_latency_ms": float(index * 100),
+            "reply_count": 1,
+            "content_assertion_passed": None if semantic else True,
+            "fallback_detected": False,
+            "duplicate_detected": False,
+            "out_of_order_detected": False,
+        }
+        for index in range(1, turn_count + 1)
+    ]
+    private_facts = {
+        "schema_version": 1,
+        "run_id": spec.environment["QA_RUN_ID"],
+        "profile_id": spec.profile_id,
+        "scenario_id": scenario_id,
+        "attempt": attempt,
+        "observations": {
+            "reply_texts": ["private semantic fixture"] if semantic else []
+        },
+    }
+    ids = [turn["request_id"] for turn in turns]
+    receipt = {
+        "schema_version": 1,
+        "kind": "live_scenario_probe",
+        "run_id": spec.environment["QA_RUN_ID"],
+        "profile_id": spec.profile_id,
+        "scenario_id": scenario_id,
+        "attempt": attempt,
+        "nonce": nonce,
+        "started_at": "2026-01-01T00:00:00.000000Z",
+        "finished_at": "2026-01-01T00:00:01.000000Z",
+        "status": "PASS",
+        "failure_code": "NONE",
+        "assertions": {
+            key: True
+            for key in live_receipts.DETERMINISTIC_ASSERTIONS[scenario_id]
+        },
+        "semantic_assertions": list(
+            live_receipts.SEMANTIC_ASSERTIONS[scenario_id]
+        ),
+        "request_ids": ids or [f"probe-{scenario_id.lower()}-{attempt}"],
+        "turn_ids": ids,
+        "trace_ids": ids,
+        "turns": turns,
+        "private_facts_sha256": live_receipts.canonical_json_sha256(private_facts),
+        "raw_content_stored": False,
+    }
+    return receipt, private_facts
+
+
+def _live_probe_runner(
+    spec: launcher.WorkerSpec, scenario_id: str, attempt: int, nonce: str
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    return _passing_live_probe(spec, scenario_id, attempt, nonce)
+
+
+def _request_passing_live_probes(spec: launcher.WorkerSpec) -> None:
+    receipts: list[dict[str, Any]] = []
+    for scenario_id in live_request.LIVE_SCENARIO_IDS:
+        request_path = live_request.request_path(spec.work, scenario_id, 1)
+        facts_path = live_request.facts_path(spec.work, scenario_id, 1)
+        facts = live_request.request_and_wait(
+            scenario_id=scenario_id,
+            attempt=1,
+            request=request_path,
+            facts=facts_path,
+            environment=spec.environment,
+            # The launcher and three fake Codex processes are intentionally
+            # concurrent; leave headroom for heavily loaded full-suite runners.
+            wait_seconds=15,
+        )
+        assert facts["receipt_sha256"] == live_receipts.canonical_json_sha256(
+            facts["receipt"]
+        )
+        receipts.append(facts["receipt"])
+
+    result = json.loads(spec.result_path.read_text())
+    scenarios = {
+        row["scenario_id"]: row
+        for row in result["scenarios"]
+        if isinstance(row, dict)
+    }
+    bound_turns: list[dict[str, Any]] = []
+    for receipt in receipts:
+        scenario = scenarios[receipt["scenario_id"]]
+        scenario.update(
+            {
+                "status": "PASS",
+                "started_at": receipt["started_at"],
+                "finished_at": receipt["finished_at"],
+                "attempts": 1,
+                "attempt_results": [
+                    {"attempt": 1, "status": "PASS", "failure": None}
+                ],
+                "request_ids": receipt["request_ids"],
+                "turn_ids": receipt["turn_ids"],
+                "trace_ids": receipt["trace_ids"],
+                "failure": None,
+            }
+        )
+        for key, value in receipt["assertions"].items():
+            if key in scenario["assertions"]:
+                scenario["assertions"][key] = value
+        for turn in receipt["turns"]:
+            bound_turns.append(
+                {
+                    "scenario_id": receipt["scenario_id"],
+                    "turn_index": turn["turn_index"],
+                    "request_id": turn["request_id"],
+                    "turn_id": turn["turn_id"],
+                    "trace_id": turn["trace_id"],
+                    "ack_latency_ms": turn["ack_latency_ms"],
+                    "reply_latency_ms": turn["reply_latency_ms"],
+                    "stage_latency_ms": {
+                        stage: None
+                        for stage in (
+                            "routing",
+                            "queue",
+                            "provider",
+                            "persistence",
+                            "delivery",
+                        )
+                    },
+                    "reply_count": turn["reply_count"],
+                    "content_assertion_passed": (
+                        True
+                        if turn["content_assertion_passed"] is None
+                        else turn["content_assertion_passed"]
+                    ),
+                    "fallback_detected": turn["fallback_detected"],
+                    "duplicate_detected": turn["duplicate_detected"],
+                    "out_of_order_detected": turn["out_of_order_detected"],
+                }
+            )
+    result["turns"] = bound_turns
+    if spec.environment["QA_QUALIFICATION_MODE"] == "diagnostic":
+        _apply_diagnostic_parent_cleanup_deferral(result)
+    spec.result_path.write_text(json.dumps(result) + "\n")
+
+
 def _wrapped_codex_command(payload: str) -> str:
     return f"/bin/zsh -c {shlex.quote(payload)}"
 
@@ -398,12 +606,10 @@ def _scenario_command_rows() -> list[dict[str, Any]]:
             },
         }
         for scenario_id in verifier.AGENT_LIVE_SCENARIO_IDS
-        for command in commands.get(
-            scenario_id,
-            (
-                f"QA_SCENARIO_ID={scenario_id} "
-                '"$QA_PYTHON_BIN" qa/qualification-probe.py --step 0',
-            ),
+        for command in (
+            commands[scenario_id]
+            if scenario_id in commands
+            else (verifier.live_request_command(scenario_id, 1),)
         )
     ]
 
@@ -555,7 +761,6 @@ def _successful_runner(
                             break
                 rows.extend(scenario_rows)
         rows.append({"type": "turn.completed", "usage": {}})
-        spec.events_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
         expected_receipt = _passing_cot_receipt(spec.profile_id)
         if cot_mode in {"failed", "failed-status-mismatch"}:
             expected_receipt.update(
@@ -565,6 +770,7 @@ def _successful_runner(
                 final_answer_correct=False,
             )
         _request_passing_cot_probe(spec, expected_receipt)
+        _request_passing_live_probes(spec)
         if cot_mode == "binding-mismatch":
             result = json.loads(spec.result_path.read_text())
             result["reasoning"]["disclosure_length"] += 1
@@ -588,11 +794,11 @@ def _successful_runner(
             "failed",
         }:
             raise AssertionError(f"unknown COT fixture mode: {cot_mode}")
+        spec.events_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
         if extra_file and index == 0:
             extra = spec.output_dir / "extra.txt"
             extra.write_text("unexpected\n")
             extra.chmod(0o600)
-        barrier.wait(timeout=5)
         return 0
 
     return run
@@ -603,6 +809,7 @@ def _launch(
     runner: launcher.ProcessRunner,
     *,
     cot_probe_runner: launcher.CotProbeRunner | None = None,
+    live_probe_runner: launcher.LiveProbeRunner | None = None,
 ) -> dict[str, Any]:
     return launcher.launch(
         codex_bin=paths["codex_bin"],
@@ -621,6 +828,7 @@ def _launch(
         timeout_seconds=600,
         process_runner=runner,
         cot_probe_runner=cot_probe_runner or _cot_probe_runner(),
+        live_probe_runner=live_probe_runner or _live_probe_runner,
         worker_python=paths["worker_python"],
     )
 
@@ -631,6 +839,7 @@ def _launch_diagnostic(
     *,
     profile_ids: tuple[str, ...] = ("official-gemini",),
     cot_probe_runner: launcher.CotProbeRunner | None = None,
+    live_probe_runner: launcher.LiveProbeRunner | None = None,
 ) -> dict[str, Any]:
     return launcher.launch(
         codex_bin=paths["codex_bin"],
@@ -649,6 +858,7 @@ def _launch_diagnostic(
         timeout_seconds=600,
         process_runner=runner,
         cot_probe_runner=cot_probe_runner or _cot_probe_runner(),
+        live_probe_runner=live_probe_runner or _live_probe_runner,
         diagnostic=True,
         profile_ids=profile_ids,
         expected_runtime="hosted_resident",
@@ -688,7 +898,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     captured: list[launcher.WorkerSpec] = []
     receipt = _launch(paths, _successful_runner(captured))
 
-    assert receipt["schema_version"] == 3
+    assert receipt["schema_version"] == 4
     assert receipt["launch_attempts"] == len(PROFILE_AGENT_TYPES)
     assert receipt["max_configured_profile_concurrency"] == 3
     assert receipt["max_observed_profile_concurrency"] == 3
@@ -702,6 +912,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         f"feedling-e2e-{profile_id}" for profile_id, _ in PROFILE_AGENT_TYPES
     ]
     assert all(len(row["cot_receipt_sha256"]) == 64 for row in receipt["workers"])
+    assert all(len(row["live_receipt_sha256"]) == 64 for row in receipt["workers"])
     assert {row["cot_delivery_status"] for row in receipt["workers"]} == {"PASS"}
     assert {row["cot_failure_code"] for row in receipt["workers"]} == {"NONE"}
     assert (
@@ -724,6 +935,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         assert "first response action MUST be a shell command execution" in spec.prompt
         assert "MUST NOT short-circuit P0-02 through" in spec.prompt
         assert "QA_SCENARIO_ID=P0-XX" in spec.prompt
+        assert "request_live_scenario_probe.py" in spec.prompt
         assert "Never invoke qa/cot_delivery_probe.py" in spec.prompt
         assert spec.environment["QA_PRIVATE_MANIFEST"].endswith(
             f"/{spec.profile_id}.json"
@@ -741,6 +953,14 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         assert spec.cot_request_path.parent == spec.work
         assert spec.cot_facts_path.parent == spec.work
         assert spec.cot_receipt_path.exists()
+        assert spec.live_receipt_path.exists()
+        live_set, live_sha = live_receipts.validate_live_scenario_receipts(
+            spec.live_receipt_path,
+            run_id="run-123",
+            profile_id=spec.profile_id,
+        )
+        assert len(live_set["receipts"]) == len(live_request.LIVE_SCENARIO_IDS)
+        assert len(live_sha) == 64
         facts = json.loads(spec.cot_facts_path.read_text())
         assert facts["profile_id"] == spec.profile_id
         assert len(facts["receipt_sha256"]) == 64
@@ -763,6 +983,31 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
                 "QA_CODEX_AUTH_JSON_B64",
             )
         )
+
+
+def test_fake_worker_completion_is_not_coupled_to_slowest_peer(tmp_path):
+    """A slow parent probe must not break an unrelated fake worker barrier."""
+
+    paths = _setup(tmp_path)
+    delayed = False
+
+    def slow_probe(spec, scenario_id, attempt, nonce):
+        nonlocal delayed
+        if spec.profile_id == "official-gemini" and not delayed:
+            delayed = True
+            # The old completion barrier expired at five seconds even though
+            # every individual request was still inside its valid deadline.
+            time.sleep(5.1)
+        return _live_probe_runner(spec, scenario_id, attempt, nonce)
+
+    receipt = _launch(
+        paths,
+        _successful_runner([]),
+        live_probe_runner=slow_probe,
+    )
+
+    assert delayed is True
+    assert len(receipt["workers"]) == len(PROFILE_AGENT_TYPES)
 
 
 @pytest.mark.parametrize(
@@ -1203,6 +1448,7 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
             "".join(json.dumps(row) + "\n" for row in rows)
         )
         _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
         return 0
 
     receipt = _launch_diagnostic(
@@ -1229,7 +1475,7 @@ def test_diagnostic_keeps_valid_worker_when_peer_uses_fallback(tmp_path):
     assert workers["official-gemini"]["cot_failure_code"] == "NONE"
     assert len(workers["official-gemini"]["cot_receipt_sha256"]) == 64
     assert workers["openrouter-glm"]["result_source"] == "deterministic_fallback"
-    assert results["official-gemini"]["status"] == "PASS"
+    assert results["official-gemini"]["status"] == "BLOCKED_EVIDENCE"
     assert results["openrouter-glm"]["status"] == "AGENT_ERROR"
 
 
@@ -1274,6 +1520,7 @@ def test_diagnostic_preserves_valid_result_when_cot_evidence_fails(
             "".join(json.dumps(row) + "\n" for row in rows)
         )
         _request_passing_cot_probe(spec)
+        _request_passing_live_probes(spec)
         if cot_mode == "binding-mismatch":
             result = json.loads(spec.result_path.read_text())
             result["reasoning"]["disclosure_length"] += 1
@@ -1537,6 +1784,145 @@ def test_completed_command_evidence_unwraps_real_codex_shell_commands(tmp_path):
     assert p0_06_phases == verifier.P0_06_COMMAND_PHASES
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        'QA_SCENARIO_ID=P0-02 "$QA_PYTHON_BIN" -c pass',
+        (
+            'QA_SCENARIO_ID=P0-02 /usr/bin/python3 '
+            '"$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" '
+            '--scenario P0-02 --attempt 1 '
+            '--request "$QA_WORK_ROOT/.live-probe-P0-02-1.request" '
+            '--facts "$QA_WORK_ROOT/live-probe-P0-02-1.facts.json"'
+        ),
+        verifier.live_request_command("P0-02", 1) + "; echo chained",
+        verifier.live_request_command("P0-02", 1).replace(
+            "live-probe-P0-02-1.facts.json",
+            "live-probe-P0-03-1.facts.json",
+        ),
+    ),
+)
+def test_live_scenario_evidence_rejects_generic_wrong_or_chained_helper(
+    tmp_path, command
+):
+    rows = _scenario_command_rows()
+    target = next(
+        row
+        for row in rows
+        if "QA_SCENARIO_ID=P0-02" in row["item"]["command"]
+    )
+    target["item"]["command"] = _wrapped_codex_command(command)
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, scenario_counts, _ = verifier.completed_command_evidence(
+        path.resolve()
+    )
+
+    assert scenario_ids != verifier.AGENT_LIVE_SCENARIO_IDS
+    assert "P0-02" not in scenario_ids
+    assert scenario_counts["P0-02"] == 1
+
+
+def test_live_scenario_evidence_rejects_extra_marker_even_beside_valid_helper(
+    tmp_path,
+):
+    rows = _scenario_command_rows()
+    target_index = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-02" in row["item"]["command"]
+    )
+    rows.insert(
+        target_index + 1,
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": _wrapped_codex_command(
+                    'QA_SCENARIO_ID=P0-02 "$QA_PYTHON_BIN" -c pass'
+                ),
+                "status": "completed",
+                "exit_code": 0,
+            },
+        },
+    )
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, scenario_counts, phases = (
+        verifier.completed_command_evidence(path.resolve())
+    )
+
+    assert scenario_ids == ()
+    assert scenario_counts["P0-02"] == 2
+    assert not verifier.scenario_command_contract_satisfied(
+        scenario_counts, phases
+    )
+
+
+def test_live_scenario_evidence_rejects_out_of_order_exact_requests(tmp_path):
+    rows = _scenario_command_rows()
+    p0_02 = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-02" in row["item"]["command"]
+    )
+    p0_03 = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-03" in row["item"]["command"]
+    )
+    rows[p0_02], rows[p0_03] = rows[p0_03], rows[p0_02]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, _, _ = verifier.completed_command_evidence(path.resolve())
+
+    assert scenario_ids == ()
+
+
+def test_live_scenario_evidence_accepts_exact_retry_order_only_for_chat_scenarios(
+    tmp_path,
+):
+    rows = _scenario_command_rows()
+    first_attempt = next(
+        index
+        for index, row in enumerate(rows)
+        if "QA_SCENARIO_ID=P0-08" in row["item"]["command"]
+    )
+    rows.insert(
+        first_attempt + 1,
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": _wrapped_codex_command(
+                    verifier.live_request_command("P0-08", 2)
+                ),
+                "status": "completed",
+                "exit_code": 0,
+            },
+        },
+    )
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.chmod(0o600)
+
+    _, scenario_ids, _, scenario_counts, phases = (
+        verifier.completed_command_evidence(path.resolve())
+    )
+
+    assert scenario_ids == verifier.AGENT_LIVE_SCENARIO_IDS
+    assert scenario_counts["P0-08"] == 2
+    assert verifier.scenario_command_contract_satisfied(scenario_counts, phases)
+    with pytest.raises(ValueError, match="unsupported live request"):
+        verifier.live_request_command("P0-02", 2)
+
+
 def test_persona_phase_contract_rejects_out_of_order_phases():
     assert (
         verifier.scenario_command_contract_satisfied(
@@ -1673,6 +2059,7 @@ def test_trusted_parent_probe_uses_fixed_interpreter_and_private_output(
         cot_receipt_path=output / "cot-delivery-receipt.json",
         cot_request_path=work / ".cot-probe-request",
         cot_facts_path=work / "cot-delivery-facts.json",
+        live_receipt_path=output / "live-scenario-receipts.json",
         prompt="test",
     )
     seen: dict[str, Any] = {}
@@ -1724,6 +2111,7 @@ def test_timeout_kills_the_entire_codex_process_group(tmp_path, monkeypatch):
         cot_receipt_path=tmp_path / "cot-delivery-receipt.json",
         cot_request_path=tmp_path / ".cot-probe-request",
         cot_facts_path=tmp_path / "cot-delivery-facts.json",
+        live_receipt_path=tmp_path / "live-scenario-receipts.json",
         prompt="test",
     )
 

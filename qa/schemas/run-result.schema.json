@@ -833,6 +833,9 @@
         "semantic_judgment_bound",
         "finalizer_ok",
         "private_evidence_deleted",
+        "archive_upload_count",
+        "archive_receipts_verified",
+        "genesis_upload_metadata_verified",
         "privacy_violation_count"
       ],
       "properties": {
@@ -856,6 +859,15 @@
           "const": true
         },
         "private_evidence_deleted": {
+          "const": true
+        },
+        "archive_upload_count": {
+          "const": 4
+        },
+        "archive_receipts_verified": {
+          "const": true
+        },
+        "genesis_upload_metadata_verified": {
           "const": true
         },
         "privacy_violation_count": {
@@ -1012,6 +1024,8 @@
         "NONCE_ECHO_CONFIRMED",
         "PERSONA_ACCEPTANCE_PASSED",
         "PERSONA_CONSISTENCY_CONFIRMED",
+        "PERSONA_FILES_ARCHIVED",
+        "PERSONA_SOURCE_METADATA_VERIFIED",
         "PERSONA_IMPORT_DONE",
         "PRIVACY_CANARY_ABSENT",
         "PROVIDER_CONFIG_MATCHED",

@@ -175,6 +175,15 @@ services:
       # Password login for the admin data-track page. Inject only through the
       # encrypted deploy env channel; the legacy admin-token routes stay valid.
       FEEDLING_ADMIN_PASSWORD: "${FEEDLING_ADMIN_PASSWORD:-}"
+      # QA-only synthetic accounts.  Disabled unless the encrypted test deploy
+      # environment opts in explicitly; not wired by any production compose.
+      FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED: "${FEEDLING_QA_SYNTHETIC_ACCOUNTS_ENABLED:-false}"
+      FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS: "${FEEDLING_QA_SYNTHETIC_ACCOUNT_MAX_TTL_SECONDS:-14400}"
+      FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS: "${FEEDLING_QA_SYNTHETIC_REAPER_INTERVAL_SECONDS:-60}"
+      # Full source SHA injected by the serialized test deploy. The image also
+      # bakes FEEDLING_GIT_COMMIT; the protected QA endpoint is available only
+      # when both full identities are valid and equal.
+      FEEDLING_TEST_DEPLOY_SHA: "${FEEDLING_TEST_DEPLOY_SHA:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       # ASGI backend: start the per-worker background services (the :9998 WS

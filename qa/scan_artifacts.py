@@ -38,8 +38,10 @@ PROFILE_IDS = (
     "openrouter-glm",
     "relay-kongbeiqie",
 )
+MEMORY_CONTRACT_PROFILE_ID = "memory-contract"
 EXPECTED_PUBLIC_FILES = {
     "run-result.json",
+    "memory-contract.json",
     "matrix.md",
     "latency.csv",
     "junit.xml",
@@ -48,6 +50,7 @@ EXPECTED_PUBLIC_FILES = {
 MAX_FILES = 512
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
+MIN_RECONSTRUCTED_FRAGMENT_BYTES = 8
 _FORBIDDEN_JSON_KEY = re.compile(
     rb'(?i)"(?:api_key|secret_key_b64|private_key(?:_b64)?|provider_key|admin_token|'
     rb'raw_chat|raw_trace|raw_(?:private_)?reasoning|body_ct|thinking_body_ct|K_user)"\s*:'
@@ -97,6 +100,34 @@ def _read_manifest(path: Path) -> dict:
     return doc
 
 
+def _read_memory_manifest(path: Path, provisioning_manifest: dict) -> dict:
+    if path.is_symlink():
+        raise ArtifactScanError("private memory manifest is missing or unreadable")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ArtifactScanError(
+            "private memory manifest is missing or unreadable"
+        ) from None
+    profiles = doc.get("profiles") if isinstance(doc, dict) else None
+    auxiliary = provisioning_manifest.get("auxiliary_accounts")
+    if (
+        not isinstance(doc, dict)
+        or doc.get("schema_version") != 1
+        or not isinstance(profiles, list)
+        or len(profiles) != 1
+        or not isinstance(profiles[0], dict)
+        or profiles[0].get("profile_id") != MEMORY_CONTRACT_PROFILE_ID
+        or not isinstance(auxiliary, list)
+        or len(auxiliary) != 1
+        or not isinstance(auxiliary[0], dict)
+        or auxiliary[0].get("profile_id") != MEMORY_CONTRACT_PROFILE_ID
+        or profiles[0] != auxiliary[0]
+    ):
+        raise ArtifactScanError("private memory manifest shape is invalid")
+    return doc
+
+
 def _read_codex_auth(path: Path) -> dict:
     if path.is_symlink():
         raise ArtifactScanError("private Codex auth is missing or unreadable")
@@ -138,6 +169,7 @@ def _read_fixture_forbidden_values(path: Path) -> set[bytes]:
 
 def _secret_values(
     manifest: dict,
+    memory_manifest: dict,
     codex_auth: dict,
     env: Mapping[str, str],
 ) -> set[bytes]:
@@ -168,6 +200,20 @@ def _secret_values(
                     "private manifest secret material is incomplete"
                 )
             add(value, decode_base64=(field == "secret_key_b64"))
+
+    memory_profiles = memory_manifest["profiles"]
+    if len(memory_profiles) != 1 or not isinstance(memory_profiles[0], dict):
+        raise ArtifactScanError("private memory manifest shape is invalid")
+    memory_profile = memory_profiles[0]
+    if memory_profile.get("profile_id") != MEMORY_CONTRACT_PROFILE_ID:
+        raise ArtifactScanError("private memory manifest shape is invalid")
+    for field in ("api_key", "secret_key_b64"):
+        value = memory_profile.get(field)
+        if not isinstance(value, str) or not value:
+            raise ArtifactScanError(
+                "private memory manifest secret material is incomplete"
+            )
+        add(value, decode_base64=(field == "secret_key_b64"))
     return values
 
 
@@ -220,18 +266,49 @@ def _json_string_fragment_streams(data: bytes) -> tuple[tuple[bytes, ...], ...]:
 
 
 def _can_reconstruct_secret(parts: tuple[bytes, ...], secret: bytes) -> bool:
-    """Detect a secret split across an ordered subsequence of JSON strings."""
-    reachable = {0}
+    """Detect a secret split across padded, ordered JSON strings.
+
+    A fragment may be surrounded by unrelated bytes inside its JSON string,
+    for example ``"prefix-sec-suffix"`` followed by
+    ``"prefix-ret-suffix"``.  Only a contiguous slice of each string may
+    advance the reconstruction, and strings may be skipped.  Fragments are at
+    least eight bytes except for a final tail after a strong match; accepting
+    arbitrary one-byte matches would make ordinary JSON text reconstruct most
+    long secrets as a coincidental character subsequence.  Keeping the
+    furthest secret offset is sufficient: any later string that could advance
+    an earlier offset beyond it necessarily contains the suffix starting at
+    the furthest offset too.
+    """
+    offset = 0
+    fragments = 0
+    max_fragments = (len(secret) + MIN_RECONSTRUCTED_FRAGMENT_BYTES - 1) // (
+        MIN_RECONSTRUCTED_FRAGMENT_BYTES
+    ) + 1
     for part in parts:
-        next_reachable = set(reachable)
-        if part:
-            for offset in reachable:
-                if secret.startswith(part, offset):
-                    end = offset + len(part)
-                    if end == len(secret):
-                        return True
-                    next_reachable.add(end)
-        reachable = next_reachable
+        if not part or offset == len(secret):
+            continue
+        remaining = secret[offset:]
+        low = 0
+        high = len(remaining)
+        # Prefix containment is monotonic, so binary search avoids a
+        # quadratic scan for long OAuth material or large JSON strings.
+        while low < high:
+            middle = (low + high + 1) // 2
+            if remaining[:middle] in part:
+                low = middle
+            else:
+                high = middle - 1
+        is_short_final_tail = (
+            fragments > 0 and low == len(remaining) and 0 < low < MIN_RECONSTRUCTED_FRAGMENT_BYTES
+        )
+        if low < MIN_RECONSTRUCTED_FRAGMENT_BYTES and not is_short_final_tail:
+            continue
+        fragments += 1
+        if fragments > max_fragments:
+            return False
+        offset += low
+        if offset == len(secret):
+            return True
     return False
 
 
@@ -242,6 +319,7 @@ def _contains_exact_secret(data: bytes, secrets: set[bytes]) -> bool:
 def scan_artifacts(
     artifact_root: Path,
     manifest_path: Path,
+    memory_manifest_path: Path,
     codex_auth_path: Path,
     fixture_path: Path,
     *,
@@ -250,8 +328,9 @@ def scan_artifacts(
     """Return fixed finding categories; an empty list means the boundary is clean."""
     active_env = os.environ if env is None else env
     manifest = _read_manifest(manifest_path)
+    memory_manifest = _read_memory_manifest(memory_manifest_path, manifest)
     codex_auth = _read_codex_auth(codex_auth_path)
-    secrets = _secret_values(manifest, codex_auth, active_env)
+    secrets = _secret_values(manifest, memory_manifest, codex_auth, active_env)
     forbidden_fixture_material = _read_fixture_forbidden_values(fixture_path)
     if artifact_root.is_symlink():
         raise ArtifactScanError("public artifact root is missing or unreadable")
@@ -341,6 +420,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--memory-manifest", type=Path, required=True)
     parser.add_argument("--codex-auth", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     return parser
@@ -352,6 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         findings = scan_artifacts(
             args.artifacts,
             args.manifest,
+            args.memory_manifest,
             args.codex_auth,
             args.fixture,
         )

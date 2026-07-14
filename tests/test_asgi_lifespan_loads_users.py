@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi.lifespan as lifespan_mod  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
+from admin import qa_synthetic_accounts  # noqa: E402
 from asgi import threadpool  # noqa: E402
 from core import store as core_store  # noqa: E402
 
@@ -56,3 +57,45 @@ async def test_lifespan_loads_registry_before_wake_bus(monkeypatch):
     assert calls.index("load_users") < calls.index("wake_bus"), (
         "load_users() must run before the wake bus starts listening"
     )
+
+
+@pytest.mark.asyncio
+async def test_qa_reaper_election_is_independent_of_general_background_mode(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        lifespan_mod,
+        "settings",
+        SimpleNamespace(
+            db_threads=1,
+            http_max_connections=2,
+            http_max_keepalive=1,
+            poller_max_active=1,
+            start_background=False,
+        ),
+    )
+    monkeypatch.setattr(accounts_registry, "load_users", lambda: None)
+    monkeypatch.setattr(lifespan_mod, "_start_wake_bus", lambda: None)
+    monkeypatch.setattr(
+        lifespan_mod,
+        "_start_qa_synthetic_reaper_leader",
+        lambda: calls.append("qa_reaper"),
+    )
+    monkeypatch.setattr(
+        qa_synthetic_accounts, "config", lambda: {"enabled": True}
+    )
+    monkeypatch.setattr(threadpool, "configure_thread_limiter", lambda: None)
+    monkeypatch.setattr(core_store, "set_async_wake_hook", lambda _fn: None)
+
+    async def _run_db(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(threadpool, "run_db", _run_db)
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with lifespan_mod.lifespan(app):
+        pass
+
+    assert calls == ["qa_reaper"]

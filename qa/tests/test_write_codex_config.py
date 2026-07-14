@@ -56,9 +56,7 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
     python_bin = python_runtime / "bin"
     python_bin.mkdir(parents=True)
     worker_python = python_bin / "python3"
-    worker_python.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n"
-    )
+    worker_python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     worker_python.chmod(0o700)
     return {
         "output": codex_home / "config.toml",
@@ -93,6 +91,7 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
     assert document["approval_policy"] == "never"
     assert document["features"]["multi_agent"] is False
     assert document["features"]["hooks"] is False
+    assert supervisor["network"]["allow_local_binding"] is False
     assert "agents" not in document
     assert filesystem[":minimal"] == "read"
     assert filesystem[str(Path(values["source_root"]).resolve())] == "read"
@@ -123,7 +122,11 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
         permission_name = writer.worker_permission_profile(profile_id)
         policy = permissions[permission_name]["filesystem"]
         own_manifest = str((manifests / f"{profile_id}.json").resolve())
+        memory_manifest = str(
+            (manifests / f"{writer.MEMORY_CONTRACT_PROFILE_ID}.json").resolve()
+        )
         assert profile["default_permissions"] == permission_name
+        assert policy[memory_manifest] == "deny"
         assert profile["model"] == "gpt-5.4"
         assert "agents" not in profile
         assert "permissions" not in profile
@@ -163,6 +166,17 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
         assert policy[str(Path(values["orchestration_receipt"]).resolve())] == "deny"
         for leaf in ("home", "tmp", "work"):
             assert policy[str((worker_root / agent_type / leaf).resolve())] == "write"
+
+
+def test_local_binding_is_explicit_and_applies_to_every_locked_profile(tmp_path):
+    values = _paths(tmp_path)
+    values["allow_local_binding"] = True
+
+    document = tomllib.loads(writer.build_config_bundle(**values).main)
+
+    for permission in document["permissions"].values():
+        assert permission["network"]["allow_local_binding"] is True
+        assert permission["network"]["domains"] == {"test-api.feedling.app": "allow"}
 
 
 def test_writer_creates_private_bundle_once(tmp_path):

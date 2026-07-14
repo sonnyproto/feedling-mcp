@@ -10,7 +10,8 @@ workstreams.
 There are two targets:
 
 - **baseline** (the local driver's default) tests the runtime currently deployed
-  on `test-api.feedling.app`, records its reported mode/version, and does not
+  on `test-api.feedling.app`, proves its protected backend build identity, records
+  its reported mode/version, and does not
   claim that a legacy `runtime_version: 2` label proves the new Hosted Runtime V2 architecture;
 - **strict Hosted Runtime V2** is an opt-in target of the protected GitHub
   workflow and additionally requires admin mode selection, homogeneous
@@ -18,13 +19,14 @@ There are two targets:
 
 The protected workflow is deliberately split across explicit trust zones:
 
-1. `verify_deployment.py` checks endpoint liveness before Codex starts and again
-   after the agent finishes. In strict V2 mode it also uses the test admin
-   credential to require one unchanged backend build, homogeneous live-worker
-   builds, and trusted pre/post candidate-SHA receipts outside the public
-   artifact directory.
+1. `verify_deployment.py` uses the test admin credential before Codex starts and
+   again after the agent finishes. Every mode requires the image-baked source SHA
+   to equal the SHA injected by the serialized test deployment. Strict V2 mode
+   additionally requires homogeneous live-worker builds. Both receipts remain
+   outside the public artifact directory.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
-   eight fresh synthetic accounts, proves invalid-key rejection and valid-key
+   eight fresh provider-profile accounts plus one dedicated memory-contract
+   account, proves invalid-key rejection and valid-key
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
    registration, and reads the configured runtime through the user API. In
@@ -32,18 +34,27 @@ The protected workflow is deliberately split across explicit trust zones:
    verify `hosted_resident`. A present-but-expired provider key becomes a fixed-code
    blocked row while provisioning continues through the other profiles, so a
    failed credential still produces a complete eight-row diagnostic matrix.
+   P0-06 uses four checked-in representative onboarding files: each profile
+   archives all four through the deployed multipart endpoint before submitting
+   the exact same bytes and filenames to Genesis for agent-judged distillation.
 3. The provisioner output is deterministically split into eight owner-only
-   one-row manifests. `run_codex_profile_workers.py` launches exactly eight
+   provider manifests and one owner-only memory manifest. Every provider
+   worker explicitly denies the memory manifest as well as all seven sibling
+   provider manifests. `run_codex_profile_workers.py` launches exactly eight
    independent top-level `codex exec` processes in three fixed batches (3+3+2),
    with at most three running concurrently. Each selected Codex profile exposes
    only its matching row and isolated home/temp/work roots; no process receives
    provider or admin credentials.
-4. Every profile agent returns one structured `profileResult`. Trusted launcher
-   code requires a completed command beginning with the exact
-   `QA_SCENARIO_ID=P0-XX` marker for every agent-driven scenario P0-02 through
-   P0-11 (with separate P0-06 capture, evidence-review, and finalization tool
-   calls), validates the result against a profile-locked Structured Outputs
-   schema, validates and binds the private P0-12 receipt to the result's exact
+4. Every profile agent returns one structured `profileResult`. For P0-02–P0-05
+   and P0-07–P0-11, trusted launcher code accepts only the exact
+   `request_live_scenario_probe.py` command and scenario/attempt-bound paths.
+   The unprivileged helper creates a one-shot request; the parent performs the
+   fixed live mutation, owns a sanitized `live-scenario-receipts.json`, and
+   binds its status, IDs, turns, duplicate/order observations, and latencies to
+   the result. P0-06 retains separate exact capture, evidence-review, and
+   finalization calls. The launcher validates the result against a
+   profile-locked Structured Outputs schema, validates and binds the private
+   P0-12 receipt to the result's exact
    request/turn/trace IDs and bounded reasoning fields, and binds the result
    hash, event hash, COT receipt hash, and root Codex thread ID into an
    owner-only lifecycle receipt. Raw command text and events/stderr stay
@@ -62,7 +73,18 @@ The protected workflow is deliberately split across explicit trust zones:
    authoritative gate schema at `schemas/run-result.schema.json` and
    mechanically derives the coverage matrix, numeric latency CSV, body-free
    JUnit XML, and exact per-profile JSON documents.
-7. `validate_run.py` is a deterministic fail-closed gate. It checks the schema,
+7. A separate deterministic memory-contract probe uses only the ninth account.
+   It always requires fresh empty recall, encrypted v1 index/fetch, a real
+   quiet-window capture write, exact route-trace correlation, disposable-chat
+   capture no-op, duplicate-fact no-growth, local-only exclusion, and supersede
+   visibility. Capture uses the checked-in resident parser/executor against the
+   deployed endpoints with deterministic agent output; this proves execution
+   and storage behavior without pretending to evaluate a live model's semantic
+   choice. Legacy stable-ID migration and stale CAS preservation must either
+   pass or be explicitly `NOT_EXERCISED` because the deployed migration kill
+   switch is disabled, according to the checked-in policy. It writes only the
+   bounded `memory-contract.json` receipt.
+8. `validate_run.py` is a deterministic fail-closed gate. It checks the schema,
    exact profile/scenario order, scenario-specific assertions/evidence/IDs,
    preserved retry observations, per-turn five-stage trace and numeric latency
    evidence, and nearest-rank p50/p95 summaries recomputed from those turns,
@@ -71,7 +93,7 @@ The protected workflow is deliberately split across explicit trust zones:
    the trusted process/thread/hash receipt, unchanged trusted pre/post liveness
    receipts, strict Runtime V2 identity when selected, exact binding to the owner-only read-only
    provisioning manifest, PASS statuses, and required artifact paths.
-8. The workflow always resets every synthetic account and uploads only the
+9. The workflow always resets all nine synthetic accounts and uploads only the
    public artifact directory after cleanup succeeds and an exact secret scan.
 
 `codex_output_schema.py --check` proves offline that the checked-in Codex
@@ -138,7 +160,6 @@ does not create Feedling users or call provider endpoints:
 ```sh
 python3 qa/run_local_diagnostic.py \
   --env-file /absolute/path/.env.test \
-  --candidate-sha <full-deployed-source-sha> \
   --codex-model gpt-5.4 \
   --profile official-gemini \
   --preflight-only
@@ -146,9 +167,11 @@ python3 qa/run_local_diagnostic.py \
 
 Then remove `--preflight-only` to create one fresh synthetic account and run the
 live Gemini canary. Repeat `--profile` to select a bounded subset, or omit it to
-run the locked eight-profile matrix. The candidate SHA is the source commit
-actually deployed by the test manifest, not automatically the tip of the Git
-branch.
+run the locked eight-profile matrix. By default, the driver discovers the full
+source SHA from the protected test-backend identity endpoint before Codex or
+provisioning starts. `--candidate-sha <full-sha>` is an optional extra assertion:
+if supplied, it must exactly match that authoritative identity. It is never a
+way to label the live deployment.
 
 For the future strict runtime candidate, append `--require-runtime-v2` to the
 same command.
@@ -175,12 +198,18 @@ rebuilding it with only a fixed, sanitized `SECURITY_FAIL` summary.
 
 The public diagnostic summary and matrix always say
 `release_qualified: false`: this path proves deployed end-user behavior and
-captures partial evidence, but it cannot substitute for protected deployment
-SHA, server-side reaper, and full-matrix release attestations.
+captures partial evidence, but it cannot substitute for server-side reaper and
+full-matrix release attestations.
 `DIAGNOSTIC_PASS` additionally requires every selected profile's trusted COT
 receipt to prove the correct final answer, one correlated reasoning event,
 reasoning metadata, and a delivered user-visible disclosure. A profile agent
 cannot override a missing, failed, or mismatched receipt with a PASS judgment.
+For P0-13, the profile artifact deliberately remains `BLOCKED_EVIDENCE` with the
+fixed parent-cleanup deferral; it is never rewritten. The diagnostic becomes
+green only after the deterministic parent publishes a separate exact cleanup
+verification and a parent-finalized per-profile projection. Attempted and
+cleaned counts must equal the selected profile count, failed IDs must be empty,
+and the provisioning manifest must be deleted and not missing.
 When an otherwise valid receipt disagrees with the agent-authored projection,
 the matrix reports the gate failure (`COT_RESULT_BINDING_MISMATCH`) separately
 from the receipt's trusted observation status/code, so the underlying product
@@ -245,9 +274,10 @@ their own virtual environments or install dependencies during qualification.
 the **test** backend's admin routes. Its value must match that deployment's
 `FEEDLING_ADMIN_TOKEN`. This is not issued by Feedling: the operator chooses one
 strong random value, for example with `openssl rand -hex 32`, and stores it only
-in secret managers. The baseline local diagnostic does not use it. Protected
-release qualification uses it for the test-account reaper and cleanup; strict
-V2 mode additionally uses it to call:
+in secret managers. Every qualification mode uses it only to read the protected
+test build identity before Codex or provisioning begins. Protected release
+qualification also uses it for the test-account reaper and cleanup; strict V2
+mode additionally uses it to call:
 
 - `POST /v1/admin/hosted-runtime-mode`, to select `hosted_resident` for a newly
   created synthetic user; and
@@ -396,8 +426,13 @@ credential-isolation controls.
 ## Before a live run
 
 For a baseline local run, the deployed endpoint needs the existing API-key
-onboarding, chat, persona, trace, and authenticated runtime-status contracts.
-This path does not wait for the new Hosted Runtime V2 feature branch.
+onboarding, chat, persona, trace, and authenticated runtime-status contracts. It
+also needs the test-only `GET /v1/admin/qa/build-identity` route, with the image's
+full `FEEDLING_GIT_COMMIT` equal to the serialized deploy's
+`FEEDLING_TEST_DEPLOY_SHA`. This branch must therefore be deployed to `test` once
+before the hardened local driver can run; absence or mismatch fails before any
+provider key is used. This path does not wait for the new Hosted Runtime V2
+feature branch.
 
 For the strict Hosted Runtime V2 GitHub release run, the deployed candidate must additionally provide:
 
@@ -411,20 +446,39 @@ For the strict Hosted Runtime V2 GitHub release run, the deployed candidate must
 - observable backend and worker build identity that can be matched to the
   candidate commit.
 
-Trigger **API-key deployed-runtime qualification** manually from the protected
-`test` branch in GitHub Actions and enter the full intended deployment commit
-SHA. Leave `runtime_target=deployed_current` to test today's deployed runtime;
-select `hosted_resident` only for the strict future-V2 proof. Any other selected
-ref explicitly fails before the protected Environment or its secrets are
-reached. Manual mode is intentional for the first stabilization phase; there is
-no push, schedule, or deployment trigger yet.
+Trigger **CI** manually at ref `test` while the standalone E2E workflow exists
+only on `test`:
 
-Do not launch a live run until the deployment contract below exists. The current
-Runtime V2 implementation does not yet expose the raw backend/worker build SHA
-fields or all test-control-plane routes required by the preflight/provisioner,
-so the workflow will intentionally fail before semantic testing rather than test
-an unknown or mixed deployment. Those are product/deployment prerequisites, not
-gaps that this testing-only branch should fake or bypass.
+```bash
+gh workflow run ci.yml --ref test
+```
+
+GitHub only accepts a direct `workflow_dispatch` for workflow files that also
+exist on the repository's default branch. The long-lived CI workflow already
+does, so its manual-only `api-key-e2e-manual` job calls the exact reusable E2E
+workflow from the selected `test` commit. Once the called workflow owns the
+shared `feedling-test-environment` lock, it refreshes `origin/test`, reads the
+backend image tag pinned in `deploy/docker-compose.phala.test.yaml`, and resolves
+that short tag to a full Git commit. This binds the gate to the deployed image,
+not to a later `deploy(test): bump ... [skip ci]` branch-head commit or an
+operator-entered SHA. The run fails closed if the compose file has mixed tags,
+the tag does not resolve inside current `test` history, or the protected live
+backend reports a different full SHA.
+
+Once `api-key-e2e.yml` also exists on the default branch, it can be dispatched
+directly from ref `test`; there is deliberately no free-form deployment-SHA
+input. Use
+`runtime_target=deployed_current` for today's runtime and reserve
+`hosted_resident` for the future strict Runtime V2 proof. Any other selected ref
+fails before the protected Environment or its secrets are reached. Manual mode
+is intentional for the first stabilization phase; there is no push, schedule,
+or deployment trigger yet.
+
+The baseline target requires authoritative backend image identity plus the
+currently deployed API-key/user contracts. The optional strict Runtime V2 target
+additionally fails before semantic testing unless worker build identity and all
+strict control-plane receipts exist. Those strict requirements are future
+product/deployment prerequisites, not claims made by this testing branch.
 
 The workflow's `always()` cleanup covers ordinary step failures, not runner loss,
 job cancellation, or infrastructure termination. The single-job runner MUST be
@@ -439,7 +493,9 @@ authoritative result JSON; the trusted publisher installs `run-result.json`, and
 `render_artifacts.py` then derives `matrix.md`,
 `latency.csv` (including numeric acknowledgement, reply, per-turn five-stage,
 and profile-summary rows), `junit.xml`, and exact `profiles/<profile-id>.json`
-copies directly beneath the same directory. No second run-ID directory is
+copies directly beneath the same directory. The deterministic memory probe adds
+`memory-contract.json`; it is not authored or adjudicated by a profile agent.
+No second run-ID directory is
 created. Public files must never contain provider keys, Feedling account keys,
 private content keys, raw chat, raw traces, raw private reasoning, or free-form
 evidence/failure text.
@@ -448,11 +504,15 @@ The seven summary fields count the exact terminal statuses of the eight profiles
 and must sum to eight. The gate is green only when all eight profiles and all
 thirteen scenarios per profile are present in order and PASS with their locked
 assertions, evidence codes, required IDs, and preserved attempt history; pre/post
-endpoint liveness is proven, with strict V2 and candidate identity required only
-when that target is selected; all chat turns have the
+endpoint liveness and backend candidate identity are proven in every mode, with
+worker identity and strict V2 controls required only when that target is
+selected; all chat turns have the
 five required trace stages and numeric per-turn stage timing; cleanup succeeds;
 each worker has a completed qualification-tool event and a valid, passing,
-result-bound P0-12 receipt; each agent-driven scenario P0-02 through P0-11 has
-its own completed command marker; required files exist; and the redaction scan
-is clean. A blocked prerequisite is useful evidence, but it is never a release
+result-bound P0-12 receipt; every parent-probed scenario has an exact helper
+command plus a valid result-bound parent receipt, while P0-06 has its three
+exact semantic phases; required files exist; and the redaction scan
+is clean. The eight always-required memory checks must pass, and the two migration
+checks must satisfy the locked migration policy. A blocked prerequisite is
+useful evidence, but it is never a release
 PASS.

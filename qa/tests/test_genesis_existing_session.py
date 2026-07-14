@@ -6,6 +6,7 @@ import os
 import stat
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,15 @@ from tools import genesis_e2e
 
 
 FORBIDDEN = "QA-PRIVATE-CANARY-7F3A"
+RELATIONSHIP_STARTED_AT = (
+    datetime.now(timezone.utc).date() - timedelta(days=5)
+).isoformat()
+ARCHIVE_FILENAMES = (
+    "mira-chat-history.txt",
+    "mira-ai-persona.md",
+    "rowan-personal-profile.txt",
+    "mira-memory-summary.md",
+)
 
 
 def _fixture() -> dict:
@@ -24,6 +34,24 @@ def _fixture() -> dict:
             "ai_persona": "Name: Mira. Warm and grounded.",
             "personal_profile": f"The user owns this private marker: {FORBIDDEN}",
             "memory_summary": "The reset ritual is jasmine tea and a walk.",
+            "upload_files": {
+                "chat_history": {
+                    "filename": "mira-chat-history.txt",
+                    "content_type": "text/plain",
+                },
+                "ai_persona": {
+                    "filename": "mira-ai-persona.md",
+                    "content_type": "text/markdown",
+                },
+                "personal_profile": {
+                    "filename": "rowan-personal-profile.txt",
+                    "content_type": "text/plain",
+                },
+                "memory_summary": {
+                    "filename": "mira-memory-summary.md",
+                    "content_type": "text/markdown",
+                },
+            },
         },
         "persona": {
             "agent_name": "Mira",
@@ -32,8 +60,7 @@ def _fixture() -> dict:
             "self_introduction_keywords": ["Mira"],
         },
         "relationship": {
-            "relationship_started_at": "2026-01-01",
-            "expected_days_with_user": 5,
+            "relationship_started_at": RELATIONSHIP_STARTED_AT,
         },
         "ground_truth": {
             "facts": [
@@ -72,6 +99,18 @@ def _capture_paths(tmp_path: Path, name: str = "capture") -> dict[str, str]:
     }
 
 
+def _archive_ok(index: int) -> tuple[int, dict]:
+    archive_id = f"{index:032x}"
+    return 201, {
+        "status": "ok",
+        "archive_id": archive_id,
+        "key": (
+            f"onboarding/user-existing-1/{archive_id}/"
+            f"{ARCHIVE_FILENAMES[index - 1]}"
+        ),
+    }
+
+
 def test_persona_transport_rejects_redirects_before_forwarding_account_key():
     request = urllib.request.Request(
         "https://test-api.feedling.app/v1/genesis/imports/plaintext",
@@ -92,14 +131,95 @@ def test_persona_transport_rejects_redirects_before_forwarding_account_key():
     assert exc_info.value.url == request.full_url
 
 
+def test_checked_in_fixture_hydrates_exact_upload_file_bytes():
+    fixture_path = (
+        Path(genesis_e2e.__file__).resolve().parent.parent
+        / "qa"
+        / "fixtures"
+        / "persona-import-v1.json"
+    )
+    raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert not any(
+        material in raw_fixture["materials"]
+        for material, _field in genesis_e2e._UPLOAD_MATERIALS
+    )
+
+    fixture = genesis_e2e._load_fixture(str(fixture_path))
+    uploads = genesis_e2e._qualification_material_uploads(fixture)
+
+    assert [upload["material"] for upload in uploads] == [
+        "chat_history",
+        "ai_persona",
+        "personal_profile",
+        "memory_summary",
+    ]
+    for upload in uploads:
+        spec = fixture["materials"]["upload_files"][upload["material"]]
+        exact_bytes = (fixture_path.parent / spec["path"]).read_bytes()
+        assert upload["content"] == exact_bytes
+        assert upload["content_sha256"] == genesis_e2e._sha256_hex(exact_bytes)
+
+
+def test_multipart_encoder_preserves_exact_file_content_and_rejects_injection():
+    content = b"line one\nline two\n"
+    body, content_type = genesis_e2e._multipart_form_body(
+        {"client_job_id": "qa-job-fixed", "filename": "persona.md"},
+        {
+            "field_name": "file",
+            "filename": "persona.md",
+            "content_type": "text/markdown",
+            "content": content,
+        },
+    )
+
+    assert content_type.startswith("multipart/form-data; boundary=----feedling-qa-")
+    assert body.count(content) == 1
+    assert b'name="file"; filename="persona.md"' in body
+    assert body.endswith(b"--\r\n")
+
+    with pytest.raises(ValueError, match="header injection"):
+        genesis_e2e._multipart_form_body(
+            {"client_job_id": "qa-job-fixed"},
+            {
+                "field_name": "file",
+                "filename": "persona.md\r\nX-Evil: yes",
+                "content_type": "text/plain",
+                "content": b"safe",
+            },
+        )
+
+
 def test_existing_session_two_phase_flow_reuses_profile_and_sanitizes_output(
     monkeypatch, tmp_path: Path
 ):
-    calls: list[tuple[str, str, dict | None]] = []
+    calls: list[dict] = []
 
-    def fake_request(method, url, api_key, *, json_body=None, **_kwargs):
+    def fake_request(
+        method,
+        url,
+        api_key,
+        *,
+        json_body=None,
+        multipart_fields=None,
+        file_upload=None,
+        **_kwargs,
+    ):
         assert api_key == "feedling-existing-api-key"
-        calls.append((method, url, json_body))
+        calls.append(
+            {
+                "method": method,
+                "url": url,
+                "json_body": json_body,
+                "multipart_fields": multipart_fields,
+                "file_upload": file_upload,
+                "request_options": _kwargs,
+            }
+        )
+        if method == "POST" and url.endswith("/v1/onboarding/archive"):
+            archive_index = sum(
+                call["url"].endswith("/v1/onboarding/archive") for call in calls
+            )
+            return _archive_ok(archive_index)
         if method == "POST" and url.endswith("/v1/genesis/imports/plaintext"):
             return 202, {"job_id": "genesis_0123456789abcdef"}
         if method == "GET" and url.endswith(
@@ -110,6 +230,14 @@ def test_existing_session_two_phase_flow_reuses_profile_and_sanitizes_output(
                     "job_id": "genesis_0123456789abcdef",
                     "status": "done",
                     "voice_ref": "voice-existing-1",
+                    "metadata": {
+                        "client_job_id": "qa-existing-fixed",
+                        "file_count": 4,
+                        "history_count": 6,
+                        "ai_persona_count": 1,
+                        "user_profile_count": 1,
+                        "memory_summary_count": 1,
+                    },
                 },
                 "persona": {
                     "content_envelope": {
@@ -126,6 +254,7 @@ def test_existing_session_two_phase_flow_reuses_profile_and_sanitizes_output(
                     "body_ct": "ciphertext",
                     "owner_user_id": "user-existing-1",
                     "days_with_user": 5,
+                    "relationship_started_at": RELATIONSHIP_STARTED_AT,
                 }
             }
         if method == "GET" and "/v1/chat/history" in url:
@@ -232,6 +361,38 @@ def test_existing_session_two_phase_flow_reuses_profile_and_sanitizes_output(
         "created_user": False,
         "configured_provider": False,
         "job_status": "done",
+        "archive_upload_count": 4,
+        "archive_receipts": [
+            {
+                "material": material,
+                "filename": spec["filename"],
+                "content_type": spec["content_type"],
+                "content_sha256": genesis_e2e._sha256_hex(
+                    _fixture()["materials"][material].encode("utf-8")
+                ),
+                "size_bytes": len(_fixture()["materials"][material].encode("utf-8")),
+                "http_status": 201,
+                "archive_id": f"{index:032x}",
+                "upload_accepted": True,
+                "storage_key_scope_verified": True,
+            }
+            for index, (material, spec) in enumerate(
+                _fixture()["materials"]["upload_files"].items(), start=1
+            )
+        ],
+        "genesis_upload_metadata": {
+            "client_job_id_exposed": True,
+            "client_job_id_matched": True,
+            "file_count_exposed": True,
+            "file_count": 4,
+            "source_counts_exposed": True,
+            "source_families": [
+                "history",
+                "ai_persona",
+                "user_profile",
+                "memory_summary",
+            ],
+        },
         "upload_http_status": 202,
         "memory_http_status": 200,
         "validate_http_status": 200,
@@ -243,29 +404,65 @@ def test_existing_session_two_phase_flow_reuses_profile_and_sanitizes_output(
     assert report["checks"]["persona_envelope_decrypted"] is True
     assert report["checks"]["memory_envelopes_decrypted"] is True
     assert report["checks"]["chat_envelopes_decrypted"] is True
-    urls = [url for _method, url, _body in calls]
+    assert report["checks"]["archive_receipts_verified"] is True
+    assert report["checks"]["genesis_upload_metadata_verified"] is True
+    urls = [call["url"] for call in calls]
     assert not any("/v1/users/register" in url for url in urls)
     assert not any("/v1/model_api/setup" in url for url in urls)
     assert not any("/v1/model_api/delete" in url for url in urls)
+    assert sum(url.endswith("/v1/onboarding/archive") for url in urls) == 4
     assert sum(url.endswith("/v1/genesis/imports/plaintext") for url in urls) == 1
-    upload_payload = calls[0][2]
+    archive_calls = [
+        call for call in calls if call["url"].endswith("/v1/onboarding/archive")
+    ]
+    fixture = _fixture()
+    for call, (material, spec) in zip(
+        archive_calls,
+        fixture["materials"]["upload_files"].items(),
+        strict=True,
+    ):
+        assert call["multipart_fields"] == {
+            "filename": spec["filename"],
+            "content_type": spec["content_type"],
+            "client_job_id": "qa-existing-fixed",
+        }
+        assert call["file_upload"] == {
+            "field_name": "file",
+            "filename": spec["filename"],
+            "content_type": spec["content_type"],
+            "content": fixture["materials"][material].encode("utf-8"),
+        }
+        assert call["request_options"] == {"retries": 1}
+    upload_payload = next(
+        call["json_body"]
+        for call in calls
+        if call["url"].endswith("/v1/genesis/imports/plaintext")
+    )
     assert upload_payload == {
         "format": "auto",
         "content": "User: tea and a walk help me reset.",
         "fresh_start": False,
         "client_job_id": "qa-existing-fixed",
-        "relationship_started_at": "2026-01-01",
+        "relationship_started_at": RELATIONSHIP_STARTED_AT,
         "ai_persona_content": "Name: Mira. Warm and grounded.",
         "personal_profile_content": f"The user owns this private marker: {FORBIDDEN}",
         "memory_summary_content": "The reset ritual is jasmine tea and a walk.",
+        "history_filename": "mira-chat-history.txt",
+        "ai_persona_filename": "mira-ai-persona.md",
+        "personal_profile_filename": "rowan-personal-profile.txt",
+        "memory_summary_filename": "mira-memory-summary.md",
     }
     rendered = json.dumps(report, ensure_ascii=False)
     rendered_receipt = json.dumps(receipt, ensure_ascii=False)
     assert FORBIDDEN not in rendered
     assert "Mira is a warm, grounded companion" not in rendered
     assert "Jasmine tea and a walk are the reset ritual" not in rendered
+    assert "onboarding/user-existing-1/" not in rendered
+    assert "feedling-existing-api-key" not in rendered
     assert "Mira is a warm, grounded companion" not in rendered_receipt
     assert "Jasmine tea and a walk are the reset ritual" not in rendered_receipt
+    assert "onboarding/user-existing-1/" not in rendered_receipt
+    assert "feedling-existing-api-key" not in rendered_receipt
 
 
 def test_privacy_firewall_covers_identity_persona_and_self_introduction_without_echoing_content():
@@ -279,7 +476,10 @@ def test_privacy_firewall_covers_identity_persona_and_self_introduction_without_
             ],
             "self_introduction": f"I am Mira. {FORBIDDEN}",
         },
-        identity_meta={"days_with_user": 5},
+        identity_meta={
+            "days_with_user": 5,
+            "relationship_started_at": RELATIONSHIP_STARTED_AT,
+        },
         memories=[
             {
                 "id": "memory-reset",
@@ -308,8 +508,62 @@ def test_privacy_firewall_covers_identity_persona_and_self_introduction_without_
     assert "Mira is grounded" not in rendered
 
 
+def test_relationship_preservation_requires_exact_anchor_and_derived_days(monkeypatch):
+    start = datetime.fromisoformat(RELATIONSHIP_STARTED_AT).date()
+    monkeypatch.setattr(genesis_e2e, "_utc_today", lambda: start + timedelta(days=5))
+    common = {
+        "identity": {},
+        "memories": [],
+        "validate": {},
+        "persona_text": "",
+        "voice_text": "",
+        "greeting_messages": [],
+        "job": {},
+    }
+
+    for days in (4, 5, 6):
+        report = genesis_e2e.evaluate_distill_acceptance(
+            _fixture(),
+            identity_meta={
+                "days_with_user": days,
+                "relationship_started_at": RELATIONSHIP_STARTED_AT,
+            },
+            **common,
+        )
+        assert report["checks"]["relationship_started_at"] is True
+        assert report["checks"]["relationship_days"] is True
+
+    wrong_anchor = genesis_e2e.evaluate_distill_acceptance(
+        _fixture(),
+        identity_meta={
+            "days_with_user": 5,
+            "relationship_started_at": "2020-01-01",
+        },
+        **common,
+    )
+    wrong_days = genesis_e2e.evaluate_distill_acceptance(
+        _fixture(),
+        identity_meta={
+            "days_with_user": 0,
+            "relationship_started_at": RELATIONSHIP_STARTED_AT,
+        },
+        **common,
+    )
+
+    assert wrong_anchor["checks"]["relationship_started_at"] is False
+    assert wrong_anchor["checks"]["relationship_days"] is True
+    assert wrong_days["checks"]["relationship_started_at"] is True
+    assert wrong_days["checks"]["relationship_days"] is False
+
+
 def test_existing_session_upload_failure_does_not_echo_server_body(tmp_path: Path):
-    def rejected(*_args, **_kwargs):
+    archive_count = 0
+
+    def rejected(_method, url, *_args, **_kwargs):
+        nonlocal archive_count
+        if url.endswith("/v1/onboarding/archive"):
+            archive_count += 1
+            return _archive_ok(archive_count)
         return 400, {"error": f"private server detail: {FORBIDDEN}"}
 
     with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
@@ -332,7 +586,7 @@ def test_existing_session_upload_failure_does_not_echo_server_body(tmp_path: Pat
     assert FORBIDDEN not in str(exc_info.value)
 
 
-def test_existing_session_upload_redirect_is_a_bounded_failure(tmp_path: Path):
+def test_existing_session_archive_redirect_is_a_bounded_failure(tmp_path: Path):
     def redirected(*_args, **_kwargs):
         return 307, {"job_id": "genesis_0123456789abcdef"}
 
@@ -349,7 +603,7 @@ def test_existing_session_upload_redirect_is_a_bounded_failure(tmp_path: Path):
 
     assert exc_info.value.as_result() == {
         "ok": False,
-        "stage": "upload",
+        "stage": "archive_chat_history",
         "code": "redirect_rejected",
         "http_status": 307,
     }
@@ -360,9 +614,11 @@ def test_existing_session_rejects_untrusted_job_id_before_poll_url_interpolation
 ):
     calls = 0
 
-    def malicious_response(*_args, **_kwargs):
+    def malicious_response(_method, url, *_args, **_kwargs):
         nonlocal calls
         calls += 1
+        if url.endswith("/v1/onboarding/archive"):
+            return _archive_ok(calls)
         return 202, {"job_id": "../../admin/secrets?x=1"}
 
     with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
@@ -382,7 +638,127 @@ def test_existing_session_rejects_untrusted_job_id_before_poll_url_interpolation
         "code": "job_id_invalid",
         "http_status": 202,
     }
+    assert calls == 5
+
+
+def test_existing_session_rejects_malformed_archive_receipt_before_genesis(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def malformed(_method, _url, *_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return 201, {"status": "ok", "archive_id": "not-an-id", "key": "key"}
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e.capture_existing_session_distill_evidence(
+            api_url="https://test-api.feedling.app",
+            api_key="feedling-existing-api-key",
+            user_id="user-existing-1",
+            content_private_key=b"k" * 32,
+            fixture=_fixture(),
+            **_capture_paths(tmp_path),
+            request_fn=malformed,
+        )
+
+    assert exc_info.value.as_result() == {
+        "ok": False,
+        "stage": "archive_chat_history",
+        "code": "archive_receipt_invalid",
+        "http_status": 201,
+    }
     assert calls == 1
+
+
+def test_existing_session_rejects_archive_receipt_with_unscoped_storage_key(
+    tmp_path: Path,
+):
+    def wrong_key(_method, _url, *_args, **_kwargs):
+        return 201, {
+            "status": "ok",
+            "archive_id": "1" * 32,
+            "key": "onboarding/another-user/" + "1" * 32 + "/mira-chat-history.txt",
+        }
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e.capture_existing_session_distill_evidence(
+            api_url="https://test-api.feedling.app",
+            api_key="feedling-existing-api-key",
+            user_id="user-existing-1",
+            content_private_key=b"k" * 32,
+            fixture=_fixture(),
+            **_capture_paths(tmp_path),
+            request_fn=wrong_key,
+        )
+
+    assert exc_info.value.as_result() == {
+        "ok": False,
+        "stage": "archive_chat_history",
+        "code": "archive_receipt_invalid",
+        "http_status": 201,
+    }
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_code"),
+    [
+        ({}, "job_client_job_id_missing"),
+        ({"client_job_id": "wrong-job"}, "job_client_job_id_mismatch"),
+        (
+            {"client_job_id": "qa-existing-fixed"},
+            "job_upload_metadata_missing",
+        ),
+        (
+            {"client_job_id": "qa-existing-fixed", "file_count": 4},
+            "job_upload_metadata_missing",
+        ),
+        (
+            {"client_job_id": "qa-existing-fixed", "file_count": 3},
+            "job_file_count_mismatch",
+        ),
+        (
+            {
+                "client_job_id": "qa-existing-fixed",
+                "file_count": "not-a-number",
+            },
+            "job_file_count_invalid",
+        ),
+        (
+            {
+                "client_job_id": "qa-existing-fixed",
+                "file_count": 4,
+                "history_count": 1,
+                "ai_persona_count": 1,
+            },
+            "job_source_counts_incomplete",
+        ),
+        (
+            {
+                "client_job_id": "qa-existing-fixed",
+                "file_count": 4,
+                "history_count": 1,
+                "ai_persona_count": 1,
+                "user_profile_count": 0,
+                "memory_summary_count": 1,
+            },
+            "job_source_family_missing",
+        ),
+    ],
+)
+def test_existing_session_rejects_exposed_bad_genesis_upload_metadata(
+    metadata: dict, expected_code: str
+):
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e._job_upload_metadata_evidence(
+            {"metadata": metadata}, "qa-existing-fixed"
+        )
+
+    assert exc_info.value.as_result() == {
+        "ok": False,
+        "stage": "distill",
+        "code": expected_code,
+    }
 
 
 def test_existing_session_helper_rejects_non_test_target_before_transport(
@@ -410,6 +786,32 @@ def test_existing_session_helper_rejects_non_test_target_before_transport(
     assert called is False
 
 
+def test_existing_session_rejects_job_token_genesis_would_normalize(
+    tmp_path: Path,
+):
+    called = False
+
+    def unexpected_request(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("transport must not run")
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e.capture_existing_session_distill_evidence(
+            api_url="https://test-api.feedling.app",
+            api_key="feedling-existing-api-key",
+            user_id="user-existing-1",
+            content_private_key=b"k" * 32,
+            fixture=_fixture(),
+            client_job_id="qa.existing.fixed",
+            **_capture_paths(tmp_path),
+            request_fn=unexpected_request,
+        )
+
+    assert exc_info.value.as_result()["code"] == "client_job_id_invalid"
+    assert called is False
+
+
 def test_existing_session_helper_requires_all_four_materials_before_transport(
     tmp_path: Path,
 ):
@@ -430,6 +832,28 @@ def test_existing_session_helper_requires_all_four_materials_before_transport(
         )
 
     assert exc_info.value.as_result()["code"] == "four_materials_required"
+
+
+def test_existing_session_helper_requires_four_upload_file_specs_before_transport(
+    tmp_path: Path,
+):
+    fixture = _fixture()
+    fixture["materials"]["upload_files"].pop("memory_summary")
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e.capture_existing_session_distill_evidence(
+            api_url="https://test-api.feedling.app",
+            api_key="feedling-existing-api-key",
+            user_id="user-existing-1",
+            content_private_key=b"k" * 32,
+            fixture=fixture,
+            **_capture_paths(tmp_path),
+            request_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("transport must not run")
+            ),
+        )
+
+    assert exc_info.value.as_result()["code"] == "four_upload_files_required"
 
 
 def test_manifest_session_loader_selects_one_existing_profile(tmp_path: Path):
@@ -493,7 +917,10 @@ def _private_evidence_payload() -> dict:
             "dimensions": [{"name": "grounded", "description": "Concrete and calm."}],
             "self_introduction": "I am Mira.",
         },
-        "identity_meta": {"days_with_user": 5},
+        "identity_meta": {
+            "days_with_user": 5,
+            "relationship_started_at": RELATIONSHIP_STARTED_AT,
+        },
         "persona_text": "Mira is a warm, grounded companion.",
         "memories": [
             {
@@ -506,6 +933,8 @@ def _private_evidence_payload() -> dict:
         "voice_text": "Warm voice.",
         "job": {"job_id": "genesis_0123456789abcdef", "status": "done"},
         "capture_checks": {
+            "archive_receipts_verified": True,
+            "genesis_upload_metadata_verified": True,
             "identity_envelope_decrypted": True,
             "persona_envelope_decrypted": True,
             "memory_envelopes_decrypted": True,
@@ -516,6 +945,38 @@ def _private_evidence_payload() -> dict:
             "created_user": False,
             "configured_provider": False,
             "job_status": "done",
+            "archive_upload_count": 4,
+            "archive_receipts": [
+                {
+                    "material": material,
+                    "filename": spec["filename"],
+                    "content_type": spec["content_type"],
+                    "content_sha256": genesis_e2e._sha256_hex(
+                        fixture["materials"][material].encode("utf-8")
+                    ),
+                    "size_bytes": len(fixture["materials"][material].encode("utf-8")),
+                    "http_status": 201,
+                    "archive_id": f"{index:032x}",
+                    "upload_accepted": True,
+                    "storage_key_scope_verified": True,
+                }
+                for index, (material, spec) in enumerate(
+                    fixture["materials"]["upload_files"].items(), start=1
+                )
+            ],
+            "genesis_upload_metadata": {
+                "client_job_id_exposed": True,
+                "client_job_id_matched": True,
+                "file_count_exposed": True,
+                "file_count": 4,
+                "source_counts_exposed": True,
+                "source_families": [
+                    "history",
+                    "ai_persona",
+                    "user_profile",
+                    "memory_summary",
+                ],
+            },
             "upload_http_status": 202,
             "memory_http_status": 200,
             "validate_http_status": 200,
@@ -524,6 +985,41 @@ def _private_evidence_payload() -> dict:
             "decrypted_agent_message_count": 1,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["transport"]["archive_receipts"][0].update(
+            content_sha256="0" * 64
+        ),
+        lambda payload: payload["transport"]["archive_receipts"][0].update(
+            filename="different-file.txt"
+        ),
+        lambda payload: payload["transport"]["archive_receipts"][1].update(
+            archive_id=payload["transport"]["archive_receipts"][0]["archive_id"]
+        ),
+        lambda payload: payload["transport"]["archive_receipts"][0].update(
+            storage_key_scope_verified=False
+        ),
+        lambda payload: payload["transport"]["genesis_upload_metadata"].update(
+            client_job_id_matched=False
+        ),
+        lambda payload: payload["identity_meta"].update(
+            relationship_started_at="2020-01-01"
+        ),
+    ],
+)
+def test_private_evidence_rejects_tampered_archive_bindings(mutate):
+    payload = _private_evidence_payload()
+    mutate(payload)
+
+    with pytest.raises(genesis_e2e.ExistingSessionDistillError) as exc_info:
+        genesis_e2e._decode_private_evidence(
+            genesis_e2e._canonical_json_bytes(payload), _fixture()
+        )
+
+    assert exc_info.value.as_result()["code"] == "private_evidence_contract_invalid"
 
 
 def _write_private_capture(
@@ -830,9 +1326,17 @@ def test_envelope_owner_mismatch_is_rejected_before_decrypt(surface: str, monkey
 def test_existing_session_rejects_foreign_output_envelopes_before_decrypt(
     surface: str, expected_code: str, monkeypatch, tmp_path: Path
 ):
+    archive_count = 0
+    submitted_job_token = ""
+
     def fake_request(method, url, _api_key, *, json_body=None, **_kwargs):
-        if method == "POST":
+        nonlocal archive_count, submitted_job_token
+        if method == "POST" and url.endswith("/v1/onboarding/archive"):
+            archive_count += 1
+            return _archive_ok(archive_count)
+        if method == "POST" and url.endswith("/v1/genesis/imports/plaintext"):
             assert json_body
+            submitted_job_token = str(json_body["client_job_id"])
             return 202, {"job_id": "genesis_0123456789abcdef"}
         if url.endswith("/v1/genesis/imports/genesis_0123456789abcdef"):
             return 200, {
@@ -840,6 +1344,14 @@ def test_existing_session_rejects_foreign_output_envelopes_before_decrypt(
                     "job_id": "genesis_0123456789abcdef",
                     "status": "done",
                     "voice_ref": "voice-existing-1",
+                    "metadata": {
+                        "client_job_id": submitted_job_token,
+                        "file_count": 4,
+                        "history_count": 1,
+                        "ai_persona_count": 1,
+                        "user_profile_count": 1,
+                        "memory_summary_count": 1,
+                    },
                 },
                 "persona": {
                     "content_envelope": {
@@ -864,6 +1376,7 @@ def test_existing_session_rejects_foreign_output_envelopes_before_decrypt(
                         "foreign-user" if surface == "identity" else "user-existing-1"
                     ),
                     "days_with_user": 5,
+                    "relationship_started_at": RELATIONSHIP_STARTED_AT,
                 }
             }
         if "/v1/chat/history" in url:

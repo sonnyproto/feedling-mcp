@@ -29,6 +29,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 from admin import admin_core
+from admin import qa_build_identity
+from admin import qa_synthetic_accounts
 from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
 from asgi.http import read_json_silent
@@ -256,6 +258,47 @@ async def tee_replication_status(request: Request):
     except admin_tee_replication.Unconfigured:
         return JSONResponse({"error": "tee_database_unconfigured"}, status_code=503)
     return JSONResponse(payload)
+
+
+@router.get("/v1/admin/qa/synthetic-account-reaper")
+async def qa_synthetic_account_reaper_status(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(qa_synthetic_accounts.status_payload)
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/qa/build-identity")
+async def qa_build_identity_status(request: Request):
+    _require_admin(request)
+    try:
+        payload = qa_build_identity.status_payload()
+    except qa_build_identity.BuildIdentityUnavailable:
+        return JSONResponse({"error": "qa_build_identity_unavailable"}, status_code=503)
+    return JSONResponse(payload)
+
+
+@router.post("/v1/admin/qa/synthetic-accounts/register")
+async def qa_synthetic_account_register(request: Request):
+    _require_admin(request)
+    payload = (await read_json_silent(request)) or {}
+    try:
+        result = await threadpool.run_db(
+            qa_synthetic_accounts.register_synthetic_account, payload
+        )
+    except qa_synthetic_accounts.SyntheticAccountBadRequest as exc:
+        return JSONResponse(
+            {"error": "invalid_synthetic_account", "detail": str(exc)},
+            status_code=400,
+        )
+    except qa_synthetic_accounts.SyntheticAccountDisabled:
+        return JSONResponse(
+            {"error": "synthetic_accounts_disabled"}, status_code=503
+        )
+    except qa_synthetic_accounts.SyntheticAccountNotReady:
+        return JSONResponse(
+            {"error": "synthetic_account_reaper_not_ready"}, status_code=503
+        )
+    return JSONResponse(result, status_code=201)
 
 
 def register_asgi(app) -> None:

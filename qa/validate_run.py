@@ -32,6 +32,32 @@ except ModuleNotFoundError:  # Direct `python qa/validate_run.py` execution.
 
 LOCKED_PROFILE_IDS = PROFILE_IDS
 LOCKED_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(1, 14))
+MEMORY_CONTRACT_PROFILE_ID = "memory-contract"
+MEMORY_CONTRACT_RECEIPT = "memory-contract.json"
+MEMORY_CONTRACT_SCHEMA = "qa/schemas/memory-contract-receipt.schema.json"
+MEMORY_MIGRATION_OPTIONAL = "allow_not_exercised_when_disabled"
+MEMORY_MIGRATION_REQUIRED = "required"
+_MEMORY_CORE_CHECKS = (
+    "fresh_empty_recall",
+    "encrypted_v1_index_fetch",
+    "quiet_window_capture_write",
+    "route_chat_message_trace",
+    "capture_noop_disposable_chitchat",
+    "duplicate_fact_no_growth",
+    "local_only_exclusion",
+    "supersede_visibility",
+)
+_MEMORY_MIGRATION_CHECKS = (
+    "legacy_migration_stable_id",
+    "stale_cas_preserves_concurrent_updates",
+)
+_MEMORY_CONTRACT_LOCK = {
+    "profile_id": MEMORY_CONTRACT_PROFILE_ID,
+    "receipt_schema": MEMORY_CONTRACT_SCHEMA,
+    "always_required_checks": list(_MEMORY_CORE_CHECKS),
+    "migration_checks": list(_MEMORY_MIGRATION_CHECKS),
+    "migration_policy": MEMORY_MIGRATION_OPTIONAL,
+}
 REQUIRED_TRACE_STAGES = (
     "routing",
     "queue",
@@ -192,11 +218,15 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
     },
     "P0-06": {
         "required_assertions": [
+            "persona_files_archived",
+            "persona_source_metadata_verified",
             "persona_import_done",
             "persona_acceptance_passed",
             "privacy_canary_absent",
         ],
         "required_evidence_codes": [
+            "PERSONA_FILES_ARCHIVED",
+            "PERSONA_SOURCE_METADATA_VERIFIED",
             "PERSONA_IMPORT_DONE",
             "PERSONA_ACCEPTANCE_PASSED",
             "PRIVACY_CANARY_ABSENT",
@@ -364,6 +394,7 @@ _ARTIFACT_CONTRACT = {
     "schema": "qa/schemas/run-result.schema.json",
     "required": [
         "run-result.json",
+        MEMORY_CONTRACT_RECEIPT,
         "matrix.md",
         "latency.csv",
         "junit.xml",
@@ -482,6 +513,109 @@ def _schema_errors(schema: Any, result: Any) -> list[str]:
     return issues
 
 
+def _read_memory_contract_receipt(artifact_root: Path) -> Any:
+    """Read the one fixed public receipt without following a link or large file."""
+
+    if artifact_root.is_symlink():
+        raise GateInputError("memory contract receipt is unreadable")
+    try:
+        root = artifact_root.resolve(strict=True)
+        candidate = root / MEMORY_CONTRACT_RECEIPT
+        metadata = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        raise GateInputError("memory contract receipt is unreadable") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > 1024 * 1024
+        or resolved != candidate
+    ):
+        raise GateInputError("memory contract receipt is unreadable")
+    return _read_json(candidate, "memory contract receipt")
+
+
+def _validate_memory_contract_receipt(
+    receipt: Any,
+    *,
+    migration_policy: str = MEMORY_MIGRATION_OPTIONAL,
+) -> list[str]:
+    """Validate deterministic memory evidence and apply the checked-in policy."""
+
+    schema_path = (
+        Path(__file__).resolve().parent
+        / "schemas"
+        / ("memory-contract-receipt.schema.json")
+    )
+    schema = _read_json(schema_path, "memory contract receipt schema")
+    schema_issues = _schema_errors(schema, receipt)
+    if schema_issues:
+        return [
+            "memory contract receipt does not satisfy its locked schema"
+            for _issue in schema_issues[:1]
+        ]
+    if not isinstance(receipt, dict):
+        return ["memory contract receipt must be a JSON object"]
+
+    checks = receipt.get("checks")
+    expected_ids = [*_MEMORY_CORE_CHECKS, *_MEMORY_MIGRATION_CHECKS]
+    if not isinstance(checks, list) or len(checks) != len(expected_ids):
+        return ["memory contract receipt check set is incomplete"]
+    expected_layers = ["live_api"] * len(_MEMORY_CORE_CHECKS) + [
+        "deployed_backend_contract"
+    ] * len(_MEMORY_MIGRATION_CHECKS)
+    if [check.get("id") for check in checks if isinstance(check, dict)] != expected_ids:
+        return ["memory contract receipt check order is invalid"]
+    if [
+        check.get("layer") for check in checks if isinstance(check, dict)
+    ] != expected_layers:
+        return ["memory contract receipt check layers are invalid"]
+
+    calculated_summary = {
+        label.lower(): sum(1 for check in checks if check.get("status") == label)
+        for label in ("PASS", "FAIL", "NOT_EXERCISED", "NOT_RUN")
+    }
+    if receipt.get("summary") != calculated_summary:
+        return ["memory contract receipt summary is inconsistent"]
+
+    core = checks[: len(_MEMORY_CORE_CHECKS)]
+    if any(
+        check.get("status") != "PASS" or check.get("failure_code") != "NONE"
+        for check in core
+    ):
+        return ["memory contract core live checks did not all pass"]
+
+    migration = checks[len(_MEMORY_CORE_CHECKS) :]
+    migration_passed = all(
+        check.get("status") == "PASS" and check.get("failure_code") == "NONE"
+        for check in migration
+    )
+    migration_disabled = all(
+        check.get("status") == "NOT_EXERCISED"
+        and check.get("failure_code") == "MIGRATION_DISABLED"
+        for check in migration
+    )
+    if migration_passed:
+        if receipt.get("status") != "PASS" or receipt.get("failure_code") != "NONE":
+            return ["memory contract receipt terminal status is inconsistent"]
+        return []
+    if (
+        migration_policy == MEMORY_MIGRATION_OPTIONAL
+        and migration_disabled
+        and receipt.get("status") == "UNVERIFIED"
+        and receipt.get("failure_code") == "MIGRATION_DISABLED"
+    ):
+        return []
+    if migration_policy not in {
+        MEMORY_MIGRATION_OPTIONAL,
+        MEMORY_MIGRATION_REQUIRED,
+    }:
+        return ["memory migration release policy is invalid"]
+    return ["memory migration contract did not satisfy the release policy"]
+
+
 def _profile_id(row: Any, *, coverage: bool) -> str:
     if not isinstance(row, dict):
         return ""
@@ -505,6 +639,7 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         "scenario_contracts",
         "trace_latency_contract",
         "reasoning_contract",
+        "deterministic_contracts",
         "artifact_contract",
     }:
         errors.append("coverage lock top-level fields do not match the release gate")
@@ -594,6 +729,10 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
     if coverage.get("reasoning_contract") != _REASONING_CONTRACT:
         errors.append(
             "coverage lock reasoning contract does not match the release gate"
+        )
+    if coverage.get("deterministic_contracts") != {"memory": _MEMORY_CONTRACT_LOCK}:
+        errors.append(
+            "coverage lock deterministic memory contract does not match the release gate"
         )
     if coverage.get("artifact_contract") != _ARTIFACT_CONTRACT:
         errors.append("coverage lock artifact contract does not match the release gate")
@@ -801,9 +940,7 @@ def _validate_orchestration_receipt(
             row.get("cot_delivery_status") != "PASS"
             or row.get("cot_failure_code") != "NONE"
         ):
-            errors.append(
-                "trusted orchestration receipt COT lifecycle is invalid"
-            )
+            errors.append("trusted orchestration receipt COT lifecycle is invalid")
         profile_digest = row.get("profile_result_sha256")
         if isinstance(profile_digest, str) and _EVIDENCE_SHA256_RE.fullmatch(
             profile_digest
@@ -1067,16 +1204,16 @@ def _validate_result_semantics(
         errors.append("result target runtime does not match the release gate")
     if str(target.get("expected_deployment_sha") or "").lower() != expected_sha.lower():
         errors.append("result expected deployment SHA does not match the release gate")
+    if (
+        str(target.get("observed_backend_sha") or "").lower()
+        != expected_sha.lower()
+    ):
+        errors.append("observed backend SHA does not match the expected deployment")
     if expected_runtime == EXPECTED_RUNTIME:
-        if str(target.get("observed_backend_sha") or "").lower() != expected_sha.lower():
-            errors.append("observed backend SHA does not match the expected deployment")
         if str(target.get("observed_worker_sha") or "").lower() != expected_sha.lower():
             errors.append("observed worker SHA does not match the expected deployment")
-    elif (
-        target.get("observed_backend_sha") is not None
-        or target.get("observed_worker_sha") is not None
-    ):
-        errors.append("baseline result must not invent deployment build identity")
+    elif target.get("observed_worker_sha") is not None:
+        errors.append("baseline result must not invent worker build identity")
 
     profiles = result.get("profiles")
     if not isinstance(profiles, list):
@@ -1220,6 +1357,9 @@ def _validate_result_semantics(
             "semantic_judgment_bound",
             "finalizer_ok",
             "private_evidence_deleted",
+            "archive_upload_count",
+            "archive_receipts_verified",
+            "genesis_upload_metadata_verified",
             "privacy_violation_count",
         }
         persona_valid = (
@@ -1239,6 +1379,10 @@ def _validate_result_semantics(
             and persona_finalizer.get("semantic_judgment_bound") is True
             and persona_finalizer.get("finalizer_ok") is True
             and persona_finalizer.get("private_evidence_deleted") is True
+            and type(persona_finalizer.get("archive_upload_count")) is int
+            and persona_finalizer.get("archive_upload_count") == 4
+            and persona_finalizer.get("archive_receipts_verified") is True
+            and persona_finalizer.get("genesis_upload_metadata_verified") is True
             and type(persona_finalizer.get("privacy_violation_count")) is int
             and persona_finalizer.get("privacy_violation_count") == 0
         )
@@ -1584,6 +1728,20 @@ def _validate_artifacts(
     return errors
 
 
+def _synthetic_lease_valid(value: Any, reaper: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("registered") is True
+        and isinstance(value.get("lease_id"), str)
+        and re.fullmatch(r"lease_[0-9a-f]{32}", value.get("lease_id", "")) is not None
+        and isinstance(value.get("expires_at"), str)
+        and bool(value.get("expires_at"))
+        and type(value.get("expires_at_epoch")) is int
+        and value["expires_at_epoch"] > 0
+        and value.get("ttl_seconds") == reaper.get("max_ttl_seconds")
+    )
+
+
 def _validate_provisioning_manifest(
     manifest: Any, result: Mapping[str, Any], expected_runtime: str
 ) -> list[str]:
@@ -1603,6 +1761,8 @@ def _validate_provisioning_manifest(
     if (
         not isinstance(reaper, dict)
         or reaper.get("enabled") is not True
+        or reaper.get("ready") is not True
+        or reaper.get("heartbeat_fresh") is not True
         or reaper.get("label_prefix") != "agent-e2e-"
         or not isinstance(reaper.get("max_ttl_seconds"), int)
         or isinstance(reaper.get("max_ttl_seconds"), bool)
@@ -1647,6 +1807,8 @@ def _validate_provisioning_manifest(
         runtime_mode = entry.get("runtime_mode")
         runtime_version = entry.get("runtime_version")
         runtime_receipt = entry.get("runtime_readback_receipt")
+        synthetic_lease = entry.get("synthetic_account_lease")
+        synthetic_lease_valid = _synthetic_lease_valid(synthetic_lease, reaper)
         runtime_readback_valid = (
             entry.get("runtime_mode_readback_verified") is True
             and isinstance(runtime_mode, str)
@@ -1696,6 +1858,7 @@ def _validate_provisioning_manifest(
             or entry.get("invalid_key_rejected") is not True
             or entry.get("valid_key_configured") is not True
             or entry.get("trace_enabled") is not True
+            or not synthetic_lease_valid
             or not runtime_contract_valid
             or not isinstance(invalid_receipt, dict)
             or invalid_receipt.get("http_status") != 400
@@ -1727,6 +1890,65 @@ def _validate_provisioning_manifest(
             errors.append(
                 f"profile {profile_id} is not bound to its provisioned account"
             )
+    auxiliary = manifest.get("auxiliary_accounts")
+    provider_user_ids = {
+        str(entry.get("user_id") or "")
+        for entry in manifest_profiles
+        if isinstance(entry, dict)
+    }
+    provider_api_keys = {
+        str(entry.get("api_key") or "")
+        for entry in manifest_profiles
+        if isinstance(entry, dict)
+    }
+    if (
+        not isinstance(auxiliary, list)
+        or len(auxiliary) != 1
+        or not isinstance(auxiliary[0], dict)
+    ):
+        errors.append(
+            "trusted provisioning manifest lacks the dedicated memory account"
+        )
+        return errors
+
+    memory = auxiliary[0]
+    memory_fields = {
+        "profile_id",
+        "purpose",
+        "label",
+        "user_id",
+        "api_key",
+        "secret_key_b64",
+        "public_key_b64",
+        "provision_status",
+        "provision_failure_code",
+        "synthetic_account_lease",
+    }
+    memory_user_id = memory.get("user_id")
+    memory_api_key = memory.get("api_key")
+    if (
+        set(memory) != memory_fields
+        or memory.get("profile_id") != MEMORY_CONTRACT_PROFILE_ID
+        or memory.get("purpose") != "deterministic_memory_contract"
+        or memory.get("label") != f"agent-e2e-{run_id}-{MEMORY_CONTRACT_PROFILE_ID}"
+        or memory.get("provision_status") != "ready"
+        or memory.get("provision_failure_code") != "NONE"
+        or not all(
+            isinstance(memory.get(field), str) and bool(memory.get(field))
+            for field in (
+                "user_id",
+                "api_key",
+                "secret_key_b64",
+                "public_key_b64",
+            )
+        )
+        or memory_user_id in provider_user_ids
+        or memory_api_key in provider_api_keys
+        or not _synthetic_lease_valid(memory.get("synthetic_account_lease"), reaper)
+    ):
+        errors.append(
+            "trusted provisioning receipt for the memory account is incomplete"
+        )
     return errors
 
 
@@ -1753,15 +1975,19 @@ def _validate_deployment_receipt(
         errors.append(f"{label} target is not the test environment")
     receipt_expected = str(receipt.get("expected_deployment_sha") or "").lower()
     backend_sha = str(receipt.get("observed_backend_sha") or "").lower()
+    deployment_sha = str(receipt.get("observed_deployment_sha") or "").lower()
     worker_sha = str(receipt.get("observed_worker_sha") or "").lower()
-    if receipt_expected != expected:
+    if (
+        receipt_expected != expected
+        or backend_sha != expected
+        or deployment_sha != expected
+        or receipt.get("deployment_identity_verified") is not True
+    ):
         errors.append(f"{label} does not match the candidate")
     live_worker_count = receipt.get("live_worker_count")
     if expected_runtime == EXPECTED_RUNTIME:
         if (
-            backend_sha != expected
-            or worker_sha != expected
-            or receipt.get("deployment_identity_verified") is not True
+            worker_sha != expected
         ):
             errors.append(f"{label} does not match the candidate")
         if (
@@ -1770,13 +1996,8 @@ def _validate_deployment_receipt(
             or live_worker_count < 1
         ):
             errors.append(f"{label} has no live V2 worker")
-    elif (
-        receipt.get("observed_backend_sha") is not None
-        or receipt.get("observed_worker_sha") is not None
-        or live_worker_count is not None
-        or receipt.get("deployment_identity_verified") is not False
-    ):
-        errors.append(f"{label} invents unavailable baseline deployment identity")
+    elif receipt.get("observed_worker_sha") is not None or live_worker_count is not None:
+        errors.append(f"{label} invents unavailable baseline worker identity")
     target = result.get("target")
     if isinstance(target, dict) and (
         str(target.get("observed_backend_sha") or "").lower() != backend_sha
@@ -1809,6 +2030,7 @@ def _validate_deployment_receipt_pair(
         "expected_runtime",
         "expected_deployment_sha",
         "observed_backend_sha",
+        "observed_deployment_sha",
         "observed_worker_sha",
         "liveness_verified",
         "deployment_identity_verified",
@@ -1854,10 +2076,13 @@ def validate_release(
         return ["expected runtime is invalid"]
     if not _SHA_RE.fullmatch(str(expected_sha or "")):
         return ["expected deployment SHA is malformed"]
+    if artifacts_path.is_symlink():
+        return ["artifact root is missing or unreadable"]
 
     coverage = _read_json(coverage_path, "coverage lock")
     schema = _read_json(schema_path, "result schema")
     result = _read_json(result_path, "run result")
+    memory_contract_receipt = _read_memory_contract_receipt(artifacts_path)
     provisioning_manifest = _read_private_manifest(provisioning_manifest_path)
     orchestration_receipt = _read_private_json(
         orchestration_receipt_path, "trusted orchestration receipt"
@@ -1874,6 +2099,12 @@ def validate_release(
     )
 
     errors = _validate_coverage(coverage, expected_runtime)
+    errors.extend(
+        _validate_memory_contract_receipt(
+            memory_contract_receipt,
+            migration_policy=_MEMORY_CONTRACT_LOCK["migration_policy"],
+        )
+    )
     schema_issues = _schema_errors(schema, result)
     errors.extend(schema_issues)
     if not schema_issues and isinstance(result, dict):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import stat
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -212,17 +213,39 @@ class FakeSmokeClient:
 
 
 class FakeAdminClient:
-    def __init__(self):
+    def __init__(self, smoke: FakeSmokeClient | None = None):
         self.calls: list[tuple[str, str, dict | None]] = []
         self.modes: dict[str, str] = {}
         self.missing_users: set[str] = set()
         self.user_lookup_status: int | None = None
+        self.smoke = smoke
+
+    def register_synthetic(self, label: str, *, ttl_seconds: int):
+        if self.smoke is None:
+            raise AssertionError("synthetic registration requires the fake smoke client")
+        session = self.smoke.register(label)
+        self.calls.append(
+            (
+                "POST",
+                provisioner.SYNTHETIC_REGISTRATION_PATH,
+                {"label": label, "ttl_seconds": ttl_seconds},
+            )
+        )
+        return session, {
+            "registered": True,
+            "lease_id": f"lease_{len(self.smoke.registered):032x}",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "expires_at_epoch": 4_070_908_800,
+            "ttl_seconds": ttl_seconds,
+        }
 
     def request(self, method: str, path: str, body=None):
         self.calls.append((method, path, body))
         if path == provisioner.SYNTHETIC_REAPER_PATH:
             return 200, {
                 "enabled": True,
+                "ready": True,
+                "heartbeat_fresh": True,
                 "label_prefix": provisioner.SYNTHETIC_LABEL_PREFIX,
                 "max_ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
             }
@@ -251,17 +274,17 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
     manifest_path = tmp_path / "private" / "profiles.json"
     env = _env()
     smoke = FakeSmokeClient()
-    admin = FakeAdminClient()
+    admin = FakeAdminClient(smoke)
 
     result = provisioner.provision(
         coverage, manifest_path, env=env, client=smoke, admin_client=admin
     )
 
     assert len(result["profiles"]) == len(provisioner.PROFILE_SPECS) == 8
-    assert len(smoke.registered) == 8
+    assert len(smoke.registered) == 9
     assert len(smoke.setup_calls) == 16
     assert len(smoke.trace_calls) == 8
-    assert len(admin.calls) == 17
+    assert len(admin.calls) == 26
     assert admin.calls[0] == ("GET", provisioner.SYNTHETIC_REAPER_PATH, None)
     for index in range(0, len(smoke.setup_calls), 2):
         assert smoke.setup_calls[index][4] == provisioner.INVALID_PROVIDER_KEY
@@ -326,6 +349,33 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "base_url": spec.expected_configured_base_url,
             "reasoning_effort": provisioner.EXPECTED_REASONING_EFFORT,
         }
+        assert profile["synthetic_account_lease"] == {
+            "registered": True,
+            "lease_id": f"lease_{list(provisioner.PROFILE_SPECS).index(profile['profile_id']) + 1:032x}",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "expires_at_epoch": 4_070_908_800,
+            "ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
+        }
+    assert persisted["auxiliary_accounts"] == [
+        {
+            "profile_id": provisioner.MEMORY_CONTRACT_PROFILE_ID,
+            "purpose": "deterministic_memory_contract",
+            "label": "agent-e2e-unit-42-memory-contract",
+            "user_id": "user-8",
+            "api_key": "feedling-account-key-8",
+            "secret_key_b64": provisioner.base64.b64encode(bytes([9]) * 32).decode(),
+            "public_key_b64": provisioner.base64.b64encode(bytes([19]) * 32).decode(),
+            "provision_status": provisioner.PROVISION_STATUS_READY,
+            "provision_failure_code": provisioner.PROVISION_FAILURE_NONE,
+            "synthetic_account_lease": {
+                "registered": True,
+                "lease_id": "lease_" + f"{9:032x}",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "expires_at_epoch": 4_070_908_800,
+                "ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
+            },
+        }
+    ]
 
 
 def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
@@ -516,7 +566,7 @@ def test_invalid_and_valid_setup_calls_use_profile_locked_base_urls(tmp_path):
         tmp_path / "manifest.json",
         env=_env(),
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
     profile_by_user = {row["user_id"]: row for row in result["profiles"]}
 
@@ -589,6 +639,104 @@ def test_admin_client_installs_reject_redirect_handler():
     )
 
 
+def test_admin_client_registers_server_marked_account_without_exporting_private_key(
+    monkeypatch,
+):
+    client = provisioner.AdminClient(
+        provisioner.ALLOWED_BASE_URL,
+        "admin-sensitive-value",
+    )
+    observed = {}
+
+    def request(method, path, body=None, **kwargs):
+        observed.update(
+            {"method": method, "path": path, "body": body, "kwargs": kwargs}
+        )
+        return 201, {
+            "user_id": "usr_unit",
+            "api_key": "account-key",
+            "label": body["label"],
+            "lease_id": "lease_" + "a" * 32,
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "expires_at_epoch": int(time.time()) + 600,
+        }
+
+    monkeypatch.setattr(client, "request", request)
+    session, receipt = client.register_synthetic(
+        "agent-e2e-run-official-gemini", ttl_seconds=600
+    )
+
+    assert observed["method"] == "POST"
+    assert observed["path"] == provisioner.SYNTHETIC_REGISTRATION_PATH
+    assert observed["kwargs"] == {"attempts": 1}
+    assert observed["body"]["access_mode"] == "model_api"
+    assert observed["body"]["ttl_seconds"] == 600
+    assert observed["body"]["public_key"] == provisioner.base64.b64encode(
+        session.pk
+    ).decode("ascii")
+    assert "private_key" not in observed["body"]
+    assert session.user_id == "usr_unit"
+    assert receipt["registered"] is True
+    assert receipt["ttl_seconds"] == 600
+
+
+def test_admin_client_never_retries_non_idempotent_synthetic_registration():
+    client = provisioner.AdminClient(
+        provisioner.ALLOWED_BASE_URL,
+        "admin-sensitive-value",
+    )
+
+    class LostResponseOpener:
+        def __init__(self):
+            self.calls = 0
+
+        def open(self, _request, timeout):
+            assert timeout == 45
+            self.calls += 1
+            if self.calls > 1:
+                pytest.fail("non-idempotent synthetic registration was retried")
+            raise TimeoutError("response lost after server commit")
+
+    opener = LostResponseOpener()
+    client._opener = opener
+
+    with pytest.raises(
+        provisioner.ProvisionError, match="synthetic account registration failed"
+    ):
+        client.register_synthetic(
+            "agent-e2e-run-official-gemini", ttl_seconds=600
+        )
+
+    assert opener.calls == 1
+
+
+def test_admin_client_rejects_unbound_synthetic_registration_receipt(monkeypatch):
+    client = provisioner.AdminClient(
+        provisioner.ALLOWED_BASE_URL,
+        "admin-sensitive-value",
+    )
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda *_args, **_kwargs: (
+            201,
+            {
+                "user_id": "usr_unit",
+                "api_key": "account-key",
+                "label": "agent-e2e-different-account",
+                "lease_id": "lease_" + "a" * 32,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "expires_at_epoch": int(time.time()) + 600,
+            },
+        ),
+    )
+
+    with pytest.raises(provisioner.ProvisionError, match="receipt is invalid"):
+        client.register_synthetic(
+            "agent-e2e-run-official-gemini", ttl_seconds=600
+        )
+
+
 def test_coverage_must_contain_exact_locked_profiles(tmp_path):
     coverage = _write_coverage(tmp_path, PROFILE_ROWS[:-1])
     with pytest.raises(
@@ -615,6 +763,43 @@ def test_provisioning_refuses_to_register_without_safe_server_reaper(tmp_path):
         }
 
     admin.request = unsafe_reaper
+    smoke = FakeSmokeClient()
+    with pytest.raises(
+        provisioner.ProvisionError, match="reaper is not safely configured"
+    ):
+        provisioner.provision(
+            _write_coverage(tmp_path),
+            tmp_path / "manifest.json",
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert smoke.registered == []
+
+
+@pytest.mark.parametrize(
+    "readiness",
+    [
+        {"ready": False, "heartbeat_fresh": False},
+        {"ready": True, "heartbeat_fresh": False},
+        {},
+    ],
+    ids=("missing-heartbeat", "stale-heartbeat", "missing-readiness-fields"),
+)
+def test_provisioning_refuses_unready_or_stale_reaper(tmp_path, readiness):
+    admin = FakeAdminClient()
+
+    def unhealthy_reaper(method, path, body=None):
+        admin.calls.append((method, path, body))
+        return 200, {
+            "enabled": True,
+            "label_prefix": provisioner.SYNTHETIC_LABEL_PREFIX,
+            "max_ttl_seconds": provisioner.MAX_SYNTHETIC_TTL_SECONDS,
+            **readiness,
+        }
+
+    admin.request = unhealthy_reaper
     smoke = FakeSmokeClient()
     with pytest.raises(
         provisioner.ProvisionError, match="reaper is not safely configured"
@@ -914,10 +1099,10 @@ def test_invalid_key_acceptance_blocks_profiles_without_collapsing_matrix(tmp_pa
         manifest,
         env=_env(),
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
-    assert len(smoke.registered) == 8
+    assert len(smoke.registered) == 9
     assert [row["profile_id"] for row in result["profiles"]] == list(
         provisioner.PROFILE_SPECS
     )
@@ -939,7 +1124,7 @@ def test_invalid_key_server_error_has_fixed_diagnostic_code(tmp_path):
         manifest,
         env=_env(),
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
     assert {row["provision_failure_code"] for row in result["profiles"]} == {
@@ -959,7 +1144,7 @@ def test_invalid_key_response_must_not_echo_submitted_secret(tmp_path):
         manifest,
         env=_env(),
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
     assert {row["provision_failure_code"] for row in result["profiles"]} == {
@@ -981,12 +1166,12 @@ def test_expired_first_provider_key_does_not_abort_remaining_profiles(tmp_path):
         manifest,
         env=env,
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
     rows = result["profiles"]
     assert [row["profile_id"] for row in rows] == list(provisioner.PROFILE_SPECS)
-    assert len(smoke.registered) == 8
+    assert len(smoke.registered) == 9
     assert rows[0]["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
     assert rows[0]["provision_failure_code"] == "VALID_KEY_REJECTED"
     assert rows[0]["api_key"] == "feedling-account-key-0"
@@ -1015,7 +1200,7 @@ def test_valid_key_transport_failure_is_sanitized_and_isolated(tmp_path):
         manifest,
         env=env,
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
     assert result["profiles"][0]["provision_failure_code"] == "VALID_KEY_SETUP_FAILED"
@@ -1039,7 +1224,7 @@ def test_valid_key_response_must_not_echo_submitted_secret(tmp_path):
         manifest,
         env=env,
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
 
     assert {row["provision_failure_code"] for row in result["profiles"]} == {
@@ -1060,7 +1245,7 @@ def test_trace_must_be_deploy_enabled(tmp_path):
         tmp_path / "manifest.json",
         env=_env(),
         client=smoke,
-        admin_client=FakeAdminClient(),
+        admin_client=FakeAdminClient(smoke),
     )
     assert {row["provision_failure_code"] for row in result["profiles"]} == {
         "TRACE_UNAVAILABLE"
@@ -1080,15 +1265,16 @@ def test_manifest_is_checkpointed_after_each_successful_profile_stage(
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
     monkeypatch.setattr(provisioner, "_atomic_write_manifest", record_write)
+    smoke = FakeSmokeClient()
     provisioner.provision(
         _write_coverage(tmp_path),
         tmp_path / "manifest.json",
         env=_env(),
-        client=FakeSmokeClient(),
-        admin_client=FakeAdminClient(),
+        client=smoke,
+        admin_client=FakeAdminClient(smoke),
     )
 
-    assert len(snapshots) == 8 * len(provisioner.PROFILE_SPECS)
+    assert len(snapshots) == 8 * len(provisioner.PROFILE_SPECS) + 1
     first_profile_stages = [snapshot["profiles"][0] for snapshot in snapshots[:8]]
     assert first_profile_stages[0]["provision_failure_code"] == (
         provisioner.PROVISION_FAILURE_INCOMPLETE
@@ -1123,7 +1309,7 @@ def test_registration_failure_remains_global_and_cleans_prior_accounts(tmp_path)
             manifest,
             env=_env(),
             client=smoke,
-            admin_client=FakeAdminClient(),
+            admin_client=FakeAdminClient(smoke),
         )
 
     assert len(smoke.registered) == 1
@@ -1146,7 +1332,7 @@ def test_manifest_write_failure_still_cleans_registered_account(tmp_path, monkey
             tmp_path / "manifest.json",
             env=_env(),
             client=smoke,
-            admin_client=FakeAdminClient(),
+            admin_client=FakeAdminClient(smoke),
         )
     assert smoke.reset_calls == [
         ("feedling-account-key-0", {"confirm": "delete-all-data"})
@@ -1361,7 +1547,7 @@ def test_provision_cli_succeeds_for_complete_matrix_with_blocked_profile(
             manifest_path,
             env=env,
             client=smoke,
-            admin_client=FakeAdminClient(),
+            admin_client=FakeAdminClient(smoke),
             runtime_requirement=kwargs.get("runtime_requirement"),
         )
 
@@ -1479,7 +1665,7 @@ def test_provision_cli_is_nonzero_when_registration_prevents_complete_manifest(
             manifest_path,
             env=env,
             client=smoke,
-            admin_client=FakeAdminClient(),
+            admin_client=FakeAdminClient(smoke),
             runtime_requirement=kwargs.get("runtime_requirement"),
         )
 

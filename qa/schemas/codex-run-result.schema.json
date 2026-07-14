@@ -559,11 +559,19 @@
               "type": "object",
               "additionalProperties": false,
               "required": [
+                "persona_files_archived",
+                "persona_source_metadata_verified",
                 "persona_import_done",
                 "persona_acceptance_passed",
                 "privacy_canary_absent"
               ],
               "properties": {
+                "persona_files_archived": {
+                  "type": "boolean"
+                },
+                "persona_source_metadata_verified": {
+                  "type": "boolean"
+                },
                 "persona_import_done": {
                   "type": "boolean"
                 },
@@ -1048,6 +1056,9 @@
         "semantic_judgment_bound",
         "finalizer_ok",
         "private_evidence_deleted",
+        "archive_upload_count",
+        "archive_receipts_verified",
+        "genesis_upload_metadata_verified",
         "privacy_violation_count"
       ],
       "properties": {
@@ -1079,6 +1090,24 @@
           ]
         },
         "private_evidence_deleted": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "archive_upload_count": {
+          "type": "integer",
+          "enum": [
+            4
+          ]
+        },
+        "archive_receipts_verified": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "genesis_upload_metadata_verified": {
           "type": "boolean",
           "enum": [
             true
@@ -1238,6 +1267,8 @@
         "NONCE_ECHO_CONFIRMED",
         "PERSONA_ACCEPTANCE_PASSED",
         "PERSONA_CONSISTENCY_CONFIRMED",
+        "PERSONA_FILES_ARCHIVED",
+        "PERSONA_SOURCE_METADATA_VERIFIED",
         "PERSONA_IMPORT_DONE",
         "PRIVACY_CANARY_ABSENT",
         "PROVIDER_CONFIG_MATCHED",

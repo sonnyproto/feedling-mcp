@@ -10,6 +10,7 @@ import hmac
 import re
 import secrets
 import threading
+from collections.abc import Callable
 from datetime import datetime
 
 import db
@@ -317,7 +318,9 @@ _USER_ID_RE = re.compile(r"^usr_[a-f0-9]{16}$")
 def _register_user(public_key: str | None = None,
                    archive_language: str | None = None,
                    access_mode: str = "official_import",
-                   label: str | None = None) -> dict:
+                   label: str | None = None,
+                   *,
+                   _qa_synthetic_metadata_builder: Callable[[dict], dict] | None = None) -> dict:
     user_id = f"usr_{secrets.token_hex(8)}"
     principal_id = _new_principal_id()
     api_key = secrets.token_hex(32)
@@ -360,9 +363,35 @@ def _register_user(public_key: str | None = None,
     # how the agent consumes it.
     if archive_language:
         entry["archive_language"] = archive_language.strip()
+    # Private assembly seam used only by the admin-authenticated QA registration
+    # route. Public /v1/users/register never supplies a builder, so a user-chosen
+    # ``agent-e2e-*`` label cannot gain reaper metadata. The builder runs only
+    # after the authoritative user/key identities exist and before the first
+    # append/upsert, allowing the lease signature to bind those identities with
+    # no post-registration marking window.
+    if _qa_synthetic_metadata_builder is not None:
+        metadata = _qa_synthetic_metadata_builder(entry)
+        if not isinstance(metadata, dict):
+            raise TypeError("QA synthetic metadata builder must return a dict")
+        entry["qa_synthetic_account"] = dict(metadata)
     with _users_lock:
         _users.append(entry)
-        persist_user(entry)  # per-row upsert (multi-worker-safe) + users broadcast
+        try:
+            persist_user(entry)  # per-row upsert (multi-worker-safe) + users broadcast
+        except Exception:
+            # ``persist_user`` can fail after the primary upsert (for example,
+            # during mirror replication or the cross-worker notification).
+            # Roll back both representations before withholding the API key so
+            # a failed registration cannot leave an inaccessible account row.
+            _users.remove(entry)
+            try:
+                db.delete_user(user_id)
+                notify_users_changed()
+            except Exception:
+                # A signed, expiring QA lease remains a final cleanup backstop
+                # if the database itself is unavailable during rollback.
+                pass
+            raise
         _key_to_user[api_key_hash] = user_id
     print(f"[users] registered {user_id} archive_language={entry.get('archive_language', 'unset')}")
     return {"user_id": user_id, "principal_id": principal_id, "api_key": api_key}

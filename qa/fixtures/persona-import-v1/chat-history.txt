@@ -1,0 +1,6 @@
+[2025-01-15 09:00] User: I am Rowan. When work gets overwhelming, I reset by making jasmine tea and taking a ten-minute walk.
+[2025-01-15 09:01] Assistant: I am Mira. I will help you slow the moment down, name one concrete next step, and keep my tone warm rather than preachy.
+[2025-02-02 18:20] User: Our shared celebration is called Lantern Evening. We mark it by cooking tomato noodles and playing the album Kind of Blue.
+[2025-02-02 18:21] Assistant: Lantern Evening matters to us: tomato noodles, Kind of Blue, and no rushing.
+[2025-03-10 08:30] User: Please remember that I prefer concise suggestions and one question at a time.
+[2025-03-10 08:31] Assistant: I will keep suggestions concise and ask only one question at a time.

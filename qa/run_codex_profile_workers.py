@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -38,6 +39,21 @@ try:
         validate_live_attempts,
     )
     from qa.validate_cot_receipt import CotReceiptError, validate_cot_receipt
+    from qa.request_live_scenario_probe import (
+        LIVE_SCENARIO_IDS as PARENT_LIVE_SCENARIO_IDS,
+        LiveProbeRequestError,
+        facts_path as live_facts_path,
+        load_request_marker,
+        request_path as live_request_path,
+    )
+    from qa.validate_live_scenario_receipts import (
+        LiveScenarioReceiptError,
+        canonical_json_sha256 as live_json_sha256,
+        validate_aggregate_object,
+        validate_live_scenario_receipts,
+        validate_receipt_object as validate_live_receipt_object,
+        validate_result_binding as validate_live_result_binding,
+    )
     from qa.verify_codex_orchestration import (
         AGENT_LIVE_SCENARIO_IDS,
         MAX_CONFIGURED_CONCURRENCY,
@@ -64,6 +80,21 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
         validate_live_attempts,
     )
     from validate_cot_receipt import CotReceiptError, validate_cot_receipt
+    from request_live_scenario_probe import (
+        LIVE_SCENARIO_IDS as PARENT_LIVE_SCENARIO_IDS,
+        LiveProbeRequestError,
+        facts_path as live_facts_path,
+        load_request_marker,
+        request_path as live_request_path,
+    )
+    from validate_live_scenario_receipts import (
+        LiveScenarioReceiptError,
+        canonical_json_sha256 as live_json_sha256,
+        validate_aggregate_object,
+        validate_live_scenario_receipts,
+        validate_receipt_object as validate_live_receipt_object,
+        validate_result_binding as validate_live_result_binding,
+    )
     from verify_codex_orchestration import (
         AGENT_LIVE_SCENARIO_IDS,
         MAX_CONFIGURED_CONCURRENCY,
@@ -100,7 +131,7 @@ _WORKER_AUTHORED_OUTPUT_FILES = frozenset(
     ("events.jsonl", "result.json", "schema.json", "stderr.log")
 )
 _EXPECTED_OUTPUT_FILES = _WORKER_AUTHORED_OUTPUT_FILES | frozenset(
-    ("cot-delivery-receipt.json",)
+    ("cot-delivery-receipt.json", "live-scenario-receipts.json")
 )
 _DIAGNOSTIC_RESULT_SOURCE_CODEX = "codex_worker"
 _DIAGNOSTIC_RESULT_SOURCE_FALLBACK = "deterministic_fallback"
@@ -128,12 +159,29 @@ final JSON response. Run exactly:
 sed -n '1,999p' "$QA_SOURCE_ROOT/qa/SOP.md"
 Then use shell commands to read the coverage lock, scenario file, and your
 one-row manifest and drive the live API journey. The trusted launcher rejects a
-result whose Codex event stream lacks completed command evidence for every
-agent-driven live scenario. For P0-02 through P0-11, begin at least one command
-for that scenario with the exact assignment `QA_SCENARIO_ID=P0-XX ` followed by
-the real probe command. One command can mark only one scenario; comments and
-uncompleted commands do not count. P0-01, P0-12, and P0-13 are independently
-evidenced by the deterministic parent.
+result whose Codex event stream lacks completed command evidence and a parent-
+owned receipt for every agent-driven live scenario. For P0-02, P0-03, P0-04,
+P0-05, and P0-07 through P0-11, request attempt 1 with exactly this command,
+substituting the same scenario ID in all four places:
+QA_SCENARIO_ID=P0-XX "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/qa/request_live_scenario_probe.py" --scenario P0-XX --attempt 1 --request "$QA_WORK_ROOT/.live-probe-P0-XX-1.request" --facts "$QA_WORK_ROOT/live-probe-P0-XX-1.facts.json"
+Read the resulting private facts file. The deterministic parent performs the
+fixed network actions, owns the authoritative receipt outside your writable
+roots, and binds its run/profile/scenario/attempt, IDs, turns, latencies, and
+deterministic assertions. You retain semantic judgment only for the explicitly
+listed P0-10/P0-11 semantic assertions. Only P0-08 through P0-11 may retry, and
+only when attempt 1's parent receipt is `AGENT_ERROR` for a transient missing-
+reply/transport observation with receipt failure code `CHAT_TIMEOUT` or
+`MISSING_REPLY`. In that one case, make attempt 2 using the
+identical command with every `1` changed to `2`, preserve both receipts and
+attempt rows, set the first attempt's locked scenario stage code and
+`reproducible: false`, and record `RETRY_OBSERVATION_RECORDED`, `RETRY_USED`,
+and the matching transient diagnostic code. A PASS,
+product failure, credential/deployment blocker, or evidence blocker is never
+retryable. Never exceed two attempts or replace attempt 1. Execute scenarios
+in SOP order. Generic markers, alternate executables, `python -c`, extra shell
+tokens, wrong paths, duplicate/out-of-order attempts, or a result greener than
+the parent receipt are rejected. P0-01, P0-12, and P0-13 have separate parent-
+owned evidence.
 P0-06 requires exactly three ordered, successful phase-marker commands. Run
 these exact commands in separate Codex tool calls:
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=CAPTURE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session --api-url "$QA_FEEDLING_BASE_URL" --session-manifest "$QA_PRIVATE_MANIFEST" --profile-id "$QA_PROFILE_ID" --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --artifact-dir "$QA_ARTIFACT_DIR"
@@ -143,6 +191,10 @@ owner-only judgment to exactly
 `$QA_WORK_ROOT/p0-06-semantic-judgment.json` in a separate unmarked tool call.
 Then run:
 QA_SCENARIO_ID=P0-06 QA_SCENARIO_PHASE=FINALIZE "$QA_PYTHON_BIN" "$QA_SOURCE_ROOT/tools/genesis_e2e.py" distill-existing-session-finalize --fixture "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json" --private-evidence "$QA_WORK_ROOT/p0-06-private-evidence.json" --semantic-judgment "$QA_WORK_ROOT/p0-06-semantic-judgment.json" --artifact-dir "$QA_ARTIFACT_DIR"
+Bind the finalizer's exact `transport.archive_upload_count`,
+`checks.archive_receipts_verified`, and
+`checks.genesis_upload_metadata_verified` values into the correspondingly named
+`persona_finalizer` fields; never infer or invent those values.
 Do not generate or execute one script that pre-fills the judgment, copies
 expected fact IDs into all-true answers, or runs capture/review/finalize without
 an intervening model judgment. The launcher rejects nonzero, missing,
@@ -175,8 +227,17 @@ reasoning tokens from ordinary input/output token totals. Always leave the
 trusted handshake files in place for launcher validation.
 When QA_QUALIFICATION_MODE is diagnostic, do not call /v1/account/reset in
 P0-13: the deterministic parent owns the only account reset so it can verify
-cleanup without an admin token. Record the account-reset assertion as false and
-diagnostic cleanup as deferred; this local run can never release-qualify.
+cleanup without an admin token. Emit the fixed diagnostic deferral exactly:
+P0-13 and its sole attempt use BLOCKED_EVIDENCE with CLEANUP /
+PRECONDITION_MISSING / reproducible=true; its trace-stages, correlation, and
+latency assertions are true, cleanup_confirmed is false, and its evidence codes
+include TRACE_CORRELATION_CONFIRMED and LATENCY_ATTRIBUTED. The top-level status
+is BLOCKED_EVIDENCE when P0-01 through P0-12 pass, and cleanup status is
+BLOCKED_EVIDENCE; cleanup attempted/provider-config
+deleted/account-reset/old-credential-rejected are all false; diagnostic_codes
+includes CLEANUP_FALLBACK_USED. The deterministic parent preserves this result,
+performs the reset, and records a separate cleanup verification. This local run
+can never release-qualify.
 In diagnostic mode, missing protected deployment-SHA or server-reaper
 attestations are known release-evidence gaps, not permission to skip the live
 journey. Record the affected assertion honestly, but continue every later
@@ -184,7 +245,8 @@ scenario. A blocked preflight assertion MUST NOT short-circuit P0-02 through
 P0-13.
 Never seek provider/admin credentials, the full provisioning manifest, another
 profile manifest, public artifacts, raw output from another process, or nested
-agents. Always attempt cleanup. Return exactly one profileResult JSON object
+agents. Always attempt cleanup except for the fixed diagnostic-only P0-13
+parent deferral above. Return exactly one profileResult JSON object
 matching the supplied output schema; include only sanitized structured evidence.
 """
 
@@ -229,6 +291,7 @@ class WorkerSpec:
     cot_receipt_path: Path
     cot_request_path: Path
     cot_facts_path: Path
+    live_receipt_path: Path
     prompt: str
 
 
@@ -243,6 +306,9 @@ class WorkerAttempt:
 
 ProcessRunner = Callable[[WorkerSpec, int], int]
 CotProbeRunner = Callable[[WorkerSpec], Mapping[str, Any]]
+LiveProbeRunner = Callable[
+    [WorkerSpec, str, int, str], tuple[Mapping[str, Any], Mapping[str, Any]]
+]
 
 
 def _utc_now() -> str:
@@ -439,6 +505,223 @@ def _run_trusted_cot_probe(spec: WorkerSpec) -> Mapping[str, Any]:
     return receipt
 
 
+def _run_trusted_live_probe(
+    spec: WorkerSpec, scenario_id: str, attempt: int, nonce: str
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Execute one allowlisted scenario in a fixed parent-owned subprocess."""
+
+    source_root = Path(spec.environment["QA_SOURCE_ROOT"])
+    worker_python = Path(spec.environment["QA_PYTHON_BIN"])
+    receipt_path = spec.output_dir / f".live-{scenario_id}-{attempt}.receipt.json"
+    private_facts_path = spec.output_dir / f".live-{scenario_id}-{attempt}.private.json"
+    if receipt_path.exists() or private_facts_path.exists():
+        raise WorkerLaunchError("trusted live probe paths are not pristine")
+    command = (
+        str(worker_python),
+        "-I",
+        "-B",
+        str(source_root / "qa" / "live_scenario_probe.py"),
+        "--manifest",
+        str(spec.environment["QA_PRIVATE_MANIFEST"]),
+        "--output",
+        str(receipt_path),
+        "--private-facts",
+        str(private_facts_path),
+        "--run-id",
+        str(spec.environment["QA_RUN_ID"]),
+        "--profile-id",
+        spec.profile_id,
+        "--scenario",
+        scenario_id,
+        "--attempt",
+        str(attempt),
+        "--nonce",
+        nonce,
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=source_root,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            capture_output=True,
+            check=False,
+            timeout=1800,
+        )
+        if completed.returncode not in (0, 2):
+            raise WorkerLaunchError("trusted live probe did not produce evidence")
+        raw_receipt = load_private_json(
+            receipt_path,
+            "trusted live scenario receipt",
+            max_bytes=2 * 1024 * 1024,
+        )
+        receipt = validate_live_receipt_object(
+            raw_receipt,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+            scenario_id=scenario_id,
+            attempt=attempt,
+        )
+        private_facts = load_private_json(
+            private_facts_path,
+            "trusted live scenario private facts",
+            max_bytes=8 * 1024 * 1024,
+        )
+        if live_json_sha256(private_facts) != receipt["private_facts_sha256"]:
+            raise WorkerLaunchError("trusted live probe facts are inconsistent")
+        return receipt, private_facts
+    except (
+        LiveScenarioReceiptError,
+        OrchestrationError,
+        OSError,
+        subprocess.SubprocessError,
+    ):
+        raise WorkerLaunchError("trusted live probe could not execute") from None
+    finally:
+        for path in (receipt_path, private_facts_path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _live_handshake_paths(
+    spec: WorkerSpec, scenario_id: str, attempt: int
+) -> tuple[Path, Path]:
+    return (
+        live_request_path(spec.work, scenario_id, attempt),
+        live_facts_path(spec.work, scenario_id, attempt),
+    )
+
+
+def _live_request_is_next(
+    receipts: Sequence[Mapping[str, Any]], scenario_id: str, attempt: int
+) -> bool:
+    if not receipts:
+        return scenario_id == PARENT_LIVE_SCENARIO_IDS[0] and attempt == 1
+    last = receipts[-1]
+    last_scenario = str(last.get("scenario_id") or "")
+    if last_scenario not in PARENT_LIVE_SCENARIO_IDS:
+        return False
+    last_index = PARENT_LIVE_SCENARIO_IDS.index(last_scenario)
+    if (
+        last.get("attempt") == 1
+        and last.get("status") == "AGENT_ERROR"
+        and last_scenario in {"P0-08", "P0-09", "P0-10", "P0-11"}
+        and scenario_id == last_scenario
+        and attempt == 2
+    ):
+        return True
+    return (
+        attempt == 1
+        and last_index + 1 < len(PARENT_LIVE_SCENARIO_IDS)
+        and scenario_id == PARENT_LIVE_SCENARIO_IDS[last_index + 1]
+    )
+
+
+def _write_live_error_facts(
+    spec: WorkerSpec, scenario_id: str, attempt: int, facts_path: Path
+) -> None:
+    if facts_path.exists():
+        return
+    _write_private_json(
+        facts_path,
+        {
+            "schema_version": 1,
+            "profile_id": spec.profile_id,
+            "scenario_id": scenario_id,
+            "attempt": attempt,
+            "receipt_sha256": None,
+            "receipt": None,
+            "private_facts": None,
+            "status": "UNAVAILABLE",
+            "failure_code": "TRUSTED_PROBE_ERROR",
+        },
+    )
+
+
+def _perform_trusted_live_handshake(
+    spec: WorkerSpec,
+    scenario_id: str,
+    attempt: int,
+    live_probe_runner: LiveProbeRunner,
+    receipts: list[dict[str, Any]],
+) -> None:
+    request_path, facts_path = _live_handshake_paths(spec, scenario_id, attempt)
+    try:
+        load_request_marker(
+            request_path,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+            scenario_id=scenario_id,
+            attempt=attempt,
+        )
+        if facts_path.exists() or not _live_request_is_next(
+            receipts, scenario_id, attempt
+        ):
+            raise WorkerLaunchError("trusted live probe request is out of order")
+        nonce = f"live_{secrets.token_hex(16)}"
+        returned_receipt, private_facts = live_probe_runner(
+            spec, scenario_id, attempt, nonce
+        )
+        receipt = validate_live_receipt_object(
+            returned_receipt,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+            scenario_id=scenario_id,
+            attempt=attempt,
+        )
+        if live_json_sha256(private_facts) != receipt["private_facts_sha256"]:
+            raise WorkerLaunchError("trusted live probe facts are inconsistent")
+        receipt_sha256 = live_json_sha256(receipt)
+        _write_private_json(
+            facts_path,
+            {
+                "schema_version": 1,
+                "profile_id": spec.profile_id,
+                "scenario_id": scenario_id,
+                "attempt": attempt,
+                "receipt_sha256": receipt_sha256,
+                "receipt": receipt,
+                "private_facts": private_facts,
+            },
+        )
+        receipts.append(receipt)
+    except (
+        LiveProbeRequestError,
+        LiveScenarioReceiptError,
+        OSError,
+        WorkerLaunchError,
+    ):
+        try:
+            _write_live_error_facts(spec, scenario_id, attempt, facts_path)
+        except WorkerLaunchError:
+            pass
+
+
+def _write_live_receipt_aggregate(
+    spec: WorkerSpec, receipts: Sequence[Mapping[str, Any]]
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "kind": "live_scenario_receipt_set",
+        "run_id": str(spec.environment["QA_RUN_ID"]),
+        "profile_id": spec.profile_id,
+        "receipts": [dict(row) for row in receipts],
+    }
+    # Validate complete successful sets before persistence.  Partial/error sets
+    # are still persisted so release verification fails closed with a bounded
+    # evidence error instead of silently omitting the parent-owned artifact.
+    try:
+        validate_aggregate_object(
+            payload,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+        )
+    except LiveScenarioReceiptError:
+        pass
+    _write_private_json(spec.live_receipt_path, payload)
+
+
 def _validate_cot_request(spec: WorkerSpec) -> None:
     try:
         with open_owned_regular(
@@ -505,12 +788,14 @@ def _run_process_with_trusted_cot(
     timeout_seconds: int,
     process_runner: ProcessRunner,
     cot_probe_runner: CotProbeRunner,
+    live_probe_runner: LiveProbeRunner,
 ) -> int:
-    """Coordinate one Codex process with one parent-owned P0-12 probe.
+    """Coordinate one Codex process with all parent-owned live probes.
 
-    The profile agent signals only when it reaches P0-12.  The parent performs
-    the live turn, validates the receipt under the supervisor-denied output
-    root, then gives the agent a sanitized, non-authoritative facts copy.
+    The profile agent can only signal fixed scenario/attempt requests.  The
+    parent executes the allowlisted probes, owns their authoritative receipts
+    under the supervisor-denied output root, and returns non-authoritative facts
+    copies for semantic judgment.
     """
 
     result: dict[str, Any] = {"exit_code": 125, "failed": False}
@@ -523,16 +808,39 @@ def _run_process_with_trusted_cot(
 
     worker = threading.Thread(target=run_worker, daemon=False)
     worker.start()
-    probe_handled = False
-    while worker.is_alive():
-        if not probe_handled and spec.cot_request_path.exists():
-            probe_handled = True
+    cot_probe_handled = False
+    live_handled: set[tuple[str, int]] = set()
+    live_receipts: list[dict[str, Any]] = []
+
+    def handle_visible_requests() -> None:
+        nonlocal cot_probe_handled
+        if not cot_probe_handled and spec.cot_request_path.exists():
+            cot_probe_handled = True
             _perform_trusted_cot_handshake(spec, cot_probe_runner)
+        for scenario_id in PARENT_LIVE_SCENARIO_IDS:
+            for attempt in (1, 2):
+                key = (scenario_id, attempt)
+                request_path, _ = _live_handshake_paths(
+                    spec, scenario_id, attempt
+                )
+                if key in live_handled or not request_path.exists():
+                    continue
+                live_handled.add(key)
+                _perform_trusted_live_handshake(
+                    spec,
+                    scenario_id,
+                    attempt,
+                    live_probe_runner,
+                    live_receipts,
+                )
+
+    while worker.is_alive():
+        handle_visible_requests()
         worker.join(timeout=0.05)
-    # Close the race where the marker and process completion become visible in
-    # the opposite order.
-    if not probe_handled and spec.cot_request_path.exists():
-        _perform_trusted_cot_handshake(spec, cot_probe_runner)
+    # Close the race where markers and process completion become visible in the
+    # opposite order, then freeze the parent-owned aggregate exactly once.
+    handle_visible_requests()
+    _write_live_receipt_aggregate(spec, live_receipts)
     if result["failed"]:
         raise WorkerLaunchError("Codex worker process runner failed")
     exit_code = result["exit_code"]
@@ -815,6 +1123,7 @@ def _prepare_specs(
         events_path = output_dir / "events.jsonl"
         stderr_path = output_dir / "stderr.log"
         cot_receipt_path = output_dir / "cot-delivery-receipt.json"
+        live_receipt_path = output_dir / "live-scenario-receipts.json"
         cot_request_path = work / ".cot-probe-request"
         cot_facts_path = work / "cot-delivery-facts.json"
         profile_schema = build_profile_schema(
@@ -883,6 +1192,7 @@ def _prepare_specs(
                 cot_receipt_path=cot_receipt_path,
                 cot_request_path=cot_request_path,
                 cot_facts_path=cot_facts_path,
+                live_receipt_path=live_receipt_path,
                 prompt=_PROFILE_PROMPT
                 + f"\nLocked assignment: {profile_id} ({agent_type}).\n",
             )
@@ -1125,6 +1435,23 @@ def _validate_cot_result_binding(
         raise WorkerLaunchError("COT receipt does not match worker result")
 
 
+def _validate_live_worker_evidence(
+    spec: WorkerSpec, profile_result: Mapping[str, Any]
+) -> tuple[dict[str, Any], str]:
+    try:
+        receipts, receipt_sha256 = validate_live_scenario_receipts(
+            spec.live_receipt_path,
+            run_id=str(spec.environment["QA_RUN_ID"]),
+            profile_id=spec.profile_id,
+        )
+        validate_live_result_binding(profile_result, receipts)
+    except (LiveScenarioReceiptError, OSError):
+        raise WorkerLaunchError(
+            "live scenario receipt does not match worker result"
+        ) from None
+    return receipts, receipt_sha256
+
+
 def _diagnostic_fallback_result(
     spec: WorkerSpec,
     manifest_dir: Path,
@@ -1169,6 +1496,7 @@ def launch(
     timeout_seconds: int,
     process_runner: ProcessRunner = _run_process,
     cot_probe_runner: CotProbeRunner = _run_trusted_cot_probe,
+    live_probe_runner: LiveProbeRunner = _run_trusted_live_probe,
     diagnostic: bool = False,
     profile_ids: Sequence[str] | None = None,
     expected_runtime: str = LOCKED_RUNTIME,
@@ -1347,6 +1675,7 @@ def launch(
                 timeout_seconds,
                 process_runner,
                 cot_probe_runner,
+                live_probe_runner,
             )
             if not isinstance(exit_code, int) or isinstance(exit_code, bool):
                 failed = True
@@ -1402,6 +1731,7 @@ def launch(
         events_sha256: str | None = None
         cot_receipt: dict[str, Any] | None = None
         cot_receipt_sha256: str | None = None
+        live_receipt_sha256: str | None = None
         cot_evidence_failure: str | None = None
         completed_command_count: int | None = None
         scenario_command_ids: tuple[str, ...] = ()
@@ -1423,6 +1753,9 @@ def launch(
                     p0_06_command_phases,
                 ) = _validated_worker_evidence(spec, identities)
                 validate_live_attempts(profile_result)
+                _, live_receipt_sha256 = _validate_live_worker_evidence(
+                    spec, profile_result
+                )
                 events_sha256 = file_sha256(
                     spec.events_path,
                     "Codex worker event stream",
@@ -1489,7 +1822,10 @@ def launch(
                 scenario_command_ids,
                 scenario_command_counts,
                 p0_06_command_phases,
-            ) = _validated_worker_evidence(spec, identities)
+                ) = _validated_worker_evidence(spec, identities)
+            _, live_receipt_sha256 = _validate_live_worker_evidence(
+                spec, profile_result
+            )
             cot_path = spec.cot_receipt_path
             if not cot_path.exists():
                 raise WorkerLaunchError("Codex worker COT receipt is missing")
@@ -1551,6 +1887,7 @@ def launch(
             "stopped_at": attempt.stopped_at,
             "profile_result_sha256": canonical_json_sha256(profile_result),
             "exec_events_sha256": events_sha256,
+            "live_receipt_sha256": live_receipt_sha256,
             "cot_receipt_sha256": cot_receipt_sha256,
             "cot_delivery_status": (
                 cot_receipt.get("status") if cot_receipt else None
@@ -1573,6 +1910,7 @@ def launch(
                     "completed_scenario_command_ids": list(scenario_command_ids),
                     "completed_scenario_command_counts": scenario_command_counts,
                     "p0_06_command_phases": list(p0_06_command_phases),
+                    "live_receipt_sha256": live_receipt_sha256,
                     "cot_receipt_sha256": cot_receipt_sha256,
                     "cot_delivery_status": (
                         cot_receipt.get("status") if cot_receipt else None

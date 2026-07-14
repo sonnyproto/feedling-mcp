@@ -2,10 +2,10 @@
 """Create a trusted deployed-runtime receipt before Codex runs.
 
 The headless qualification agent must not be the authority for its own target.
-Baseline mode proves only that the designated test endpoint is live. Strict V2
-mode additionally reads the admin-gated V2 metrics endpoint, requires one exact
-backend build and one homogeneous live-worker build, and checkpoints a read-only
-receipt outside the agent's writable artifact directory.
+Every mode reads the test-only admin build-identity endpoint and requires the
+image-baked source SHA to equal the SHA injected by the serialized test deploy.
+Strict V2 mode additionally requires one homogeneous live-worker build. The
+read-only receipt stays outside the agent's writable artifact directory.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def _write_read_only_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def verify_deployment(
-    expected_sha: str,
+    expected_sha: str | None,
     receipt_path: Path,
     *,
     env: Mapping[str, str] | None = None,
@@ -82,8 +82,8 @@ def verify_deployment(
     expected_runtime: str = RUNTIME_V2_RUNTIME,
 ) -> dict[str, Any]:
     active_env = os.environ if env is None else env
-    expected = str(expected_sha or "").strip().lower()
-    if not _SHA_RE.fullmatch(expected):
+    expected_input = str(expected_sha or "").strip().lower()
+    if expected_input and not _SHA_RE.fullmatch(expected_input):
         raise DeploymentVerificationError("expected deployment SHA is malformed")
     if expected_runtime not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}:
         raise DeploymentVerificationError("runtime requirement is invalid")
@@ -91,32 +91,48 @@ def verify_deployment(
     token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
     client = admin_client or AdminClient(base_url, token)
 
+    try:
+        status, identity = client.request("GET", "/v1/admin/qa/build-identity")
+    except ProvisionError:
+        raise DeploymentVerificationError(
+            "test deployment build identity endpoint was unreachable"
+        ) from None
+    if status != 200 or not isinstance(identity, dict):
+        raise DeploymentVerificationError(
+            "test deployment build identity endpoint is unavailable"
+        )
+    backend_sha = str(identity.get("backend_sha") or "").strip().lower()
+    deployment_sha = str(identity.get("deployment_sha") or "").strip().lower()
+    if (
+        identity.get("schema_version") != 1
+        or identity.get("environment") != "test"
+        or identity.get("identity_verified") is not True
+        or not _SHA_RE.fullmatch(backend_sha)
+        or not _SHA_RE.fullmatch(deployment_sha)
+        or backend_sha != deployment_sha
+    ):
+        raise DeploymentVerificationError(
+            "test deployment build identity is invalid"
+        )
+    expected = expected_input or backend_sha
+    if backend_sha != expected:
+        raise DeploymentVerificationError(
+            "deployed backend build does not match the candidate"
+        )
+
     if expected_runtime == BASELINE_RUNTIME:
-        try:
-            status, payload = client.request("GET", "/healthz")
-        except ProvisionError:
-            raise DeploymentVerificationError(
-                "test deployment health endpoint was unreachable"
-            ) from None
-        if (
-            status != 200
-            or not isinstance(payload, dict)
-            or payload.get("ok") is not True
-        ):
-            raise DeploymentVerificationError(
-                "test deployment health endpoint is unavailable"
-            )
         receipt = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "environment": "test",
             "base_url": base_url,
             "expected_runtime": BASELINE_RUNTIME,
             "expected_deployment_sha": expected,
-            "observed_backend_sha": None,
+            "observed_backend_sha": backend_sha,
+            "observed_deployment_sha": deployment_sha,
             "observed_worker_sha": None,
             "live_worker_count": None,
             "liveness_verified": True,
-            "deployment_identity_verified": False,
+            "deployment_identity_verified": True,
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -138,10 +154,10 @@ def verify_deployment(
             "V2 deployment identity endpoint is unavailable"
         )
 
-    backend_sha = str(payload.get("backend_sha") or "").strip().lower()
+    metrics_backend_sha = str(payload.get("backend_sha") or "").strip().lower()
     worker_shas_raw = payload.get("worker_shas")
     live_workers = payload.get("live_workers")
-    if not _SHA_RE.fullmatch(backend_sha):
+    if not _SHA_RE.fullmatch(metrics_backend_sha):
         raise DeploymentVerificationError(
             "V2 metrics has no valid backend build identity"
         )
@@ -166,7 +182,11 @@ def verify_deployment(
             "V2 worker build identity is incomplete or heterogeneous"
         )
     worker_sha = next(iter(worker_shas))
-    if backend_sha != expected or worker_sha != expected:
+    if (
+        metrics_backend_sha != expected
+        or metrics_backend_sha != backend_sha
+        or worker_sha != expected
+    ):
         raise DeploymentVerificationError(
             "deployed backend and worker builds do not match the candidate"
         )
@@ -178,6 +198,7 @@ def verify_deployment(
         "expected_runtime": RUNTIME_V2_RUNTIME,
         "expected_deployment_sha": expected,
         "observed_backend_sha": backend_sha,
+        "observed_deployment_sha": deployment_sha,
         "observed_worker_sha": worker_sha,
         "live_worker_count": live_workers,
         "liveness_verified": True,

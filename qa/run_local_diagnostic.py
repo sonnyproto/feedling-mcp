@@ -13,12 +13,14 @@ import argparse
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import os
 import platform
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -35,16 +37,20 @@ try:
     from qa import provision_profiles
     from qa import render_diagnostic_artifacts
     from qa import run_codex_profile_workers
+    from qa import verify_deployment as deployment_verifier
     from qa import write_codex_config
     from qa.orchestration_contract import PROFILE_AGENT_TYPES, PROFILE_IDS
+    from qa.validate_diagnostic_attempts import parent_cleanup_is_deferred
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     import harness_provenance  # type: ignore[no-redef]
     import install_codex_auth  # type: ignore[no-redef]
     import provision_profiles  # type: ignore[no-redef]
     import render_diagnostic_artifacts  # type: ignore[no-redef]
     import run_codex_profile_workers  # type: ignore[no-redef]
+    import verify_deployment as deployment_verifier  # type: ignore[no-redef]
     import write_codex_config  # type: ignore[no-redef]
     from orchestration_contract import PROFILE_AGENT_TYPES, PROFILE_IDS
+    from validate_diagnostic_attempts import parent_cleanup_is_deferred
 
 
 LOCKED_BASE_URL = "https://test-api.feedling.app"
@@ -106,6 +112,7 @@ _TRUSTED_LOCAL_CODEX = {
         "tree_sha256": "0e56cced8d08acc8da8f27e3eb2688eab57902037efa8b856ceb1d188e6bbfda",
     }
 }
+_BENCHMARK_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 class LocalDiagnosticError(RuntimeError):
@@ -373,6 +380,7 @@ class RunPaths:
     worker_outputs: Path
     aggregation_inputs: Path
     orchestration_receipt: Path
+    deployment_receipt: Path
 
 
 @dataclass(frozen=True)
@@ -380,6 +388,9 @@ class DiagnosticDependencies:
     provision: Callable[..., dict[str, Any]] = provision_profiles.provision
     cleanup: Callable[..., dict[str, Any]] = provision_profiles.cleanup
     launch: Callable[..., dict[str, Any]] = run_codex_profile_workers.launch
+    verify_deployment: Callable[..., dict[str, Any]] = (
+        deployment_verifier.verify_deployment
+    )
     verify_codex_version: Callable[[Path], None] = (
         run_codex_profile_workers.verify_codex_version
     )
@@ -709,6 +720,29 @@ def prepare_environment(
     return env, tuple(validated_credentials)
 
 
+def _deployment_environment(loaded: Mapping[str, str]) -> dict[str, str]:
+    qa_token = str(loaded.get("QA_TEST_ADMIN_TOKEN") or "").strip()
+    backend_token = str(loaded.get("FEEDLING_ADMIN_TOKEN") or "").strip()
+    if qa_token and backend_token and qa_token != backend_token:
+        raise LocalDiagnosticError(
+            "QA_TEST_ADMIN_TOKEN and FEEDLING_ADMIN_TOKEN do not match"
+        )
+    token = qa_token or backend_token
+    if (
+        not token
+        or len(token) < 8
+        or len(token) > 64 * 1024
+        or any(character.isspace() for character in token)
+    ):
+        raise LocalDiagnosticError(
+            "missing or invalid test admin credential for deployment verification"
+        )
+    return {
+        "QA_FEEDLING_BASE_URL": LOCKED_BASE_URL,
+        "QA_TEST_ADMIN_TOKEN": token,
+    }
+
+
 def _loaded_credential_values(loaded: Mapping[str, str]) -> tuple[str, ...]:
     """Return every provider credential loaded, not only the selected subset."""
 
@@ -851,6 +885,7 @@ def create_run_paths(options: DiagnosticOptions, run_id: str) -> RunPaths:
         worker_outputs=worker_outputs,
         aggregation_inputs=aggregation_inputs,
         orchestration_receipt=private_root / "orchestration-receipt.json",
+        deployment_receipt=private_root / "deployment-receipt.json",
     )
 
 
@@ -1160,6 +1195,73 @@ def _verify_worker_runtime(
         )
 
 
+def _verify_worker_network(
+    options: DiagnosticOptions,
+    paths: RunPaths,
+    *,
+    profile_id: str,
+    agent_type: str,
+) -> None:
+    """Prove the real worker sandbox can reach only the locked test endpoint."""
+
+    worker_python, _runtime_roots = _canonical_worker_runtime(options)
+    agent_root = paths.worker_root / agent_type
+    work = agent_root / "work"
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+        "NO_COLOR": "1",
+        "HOME": str(agent_root / "home"),
+        "TMPDIR": str(agent_root / "tmp"),
+        "CODEX_HOME": str(paths.codex_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    script = (
+        "import sys, urllib.request; "
+        "u=sys.argv[1]; "
+        "r=urllib.request.urlopen(urllib.request.Request(u, headers={"
+        "'User-Agent':'feedling-e2e-network-preflight'}), timeout=15); "
+        "assert r.status == 200 and r.geturl() == u; "
+        "r.read(4097); r.close()"
+    )
+    command = (
+        str(options.codex_bin),
+        "sandbox",
+        "-p",
+        agent_type,
+        "-P",
+        write_codex_config.worker_permission_profile(profile_id),
+        "--include-managed-config",
+        "-C",
+        str(work),
+        "--",
+        str(worker_python),
+        "-I",
+        "-B",
+        "-c",
+        script,
+        f"{LOCKED_BASE_URL}/healthz",
+    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=work,
+            env=environment,
+            check=False,
+            capture_output=True,
+            timeout=45,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise LocalDiagnosticError(
+            "locked test endpoint sandbox preflight could not execute"
+        ) from None
+    if result.returncode != 0:
+        raise LocalDiagnosticError(
+            "locked test endpoint is unreachable from the Codex worker sandbox"
+        )
+
+
 def _verify_codex_exec(options: DiagnosticOptions, paths: RunPaths) -> dict[str, Any]:
     """Prove the isolated OAuth/model can complete one tool-free headless turn."""
 
@@ -1171,6 +1273,12 @@ def _verify_codex_exec(options: DiagnosticOptions, paths: RunPaths) -> dict[str,
     temporary = agent_root / "tmp"
     work = agent_root / "work"
     _verify_worker_runtime(
+        options,
+        paths,
+        profile_id=profile_id,
+        agent_type=agent_type,
+    )
+    _verify_worker_network(
         options,
         paths,
         profile_id=profile_id,
@@ -1283,6 +1391,7 @@ def _verify_codex_exec(options: DiagnosticOptions, paths: RunPaths) -> dict[str,
         "event_stream_valid": True,
         "tool_calls_observed": False,
         "worker_runtime_valid": True,
+        "worker_network_valid": True,
         "profile_id": profile_id,
         "model": options.codex_model,
     }
@@ -1402,17 +1511,33 @@ def _json_fragment_streams(data: bytes) -> tuple[tuple[bytes, ...], ...]:
 
 
 def _reconstructs_secret(parts: tuple[bytes, ...], secret: bytes) -> bool:
-    reachable = {0}
+    offset = 0
+    fragments = 0
+    minimum_fragment_bytes = 8
+    max_fragments = (len(secret) + minimum_fragment_bytes - 1) // minimum_fragment_bytes + 1
     for part in parts:
-        following = set(reachable)
-        if part:
-            for offset in reachable:
-                if secret.startswith(part, offset):
-                    end = offset + len(part)
-                    if end == len(secret):
-                        return True
-                    following.add(end)
-        reachable = following
+        if not part or offset == len(secret):
+            continue
+        remaining = secret[offset:]
+        low = 0
+        high = len(remaining)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if remaining[:middle] in part:
+                low = middle
+            else:
+                high = middle - 1
+        is_short_final_tail = (
+            fragments > 0 and low == len(remaining) and 0 < low < minimum_fragment_bytes
+        )
+        if low < minimum_fragment_bytes and not is_short_final_tail:
+            continue
+        fragments += 1
+        if fragments > max_fragments:
+            return False
+        offset += low
+        if offset == len(secret):
+            return True
     return False
 
 
@@ -1708,8 +1833,29 @@ def _validate_diagnostic_manifest(
         )
 
 
-def _build_codex_config(options: DiagnosticOptions, paths: RunPaths) -> None:
+def _uses_benchmark_fake_ip(host: str) -> bool:
+    """Return true only when every resolved address is in RFC 2544 test space."""
+
+    try:
+        rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for row in rows:
+        try:
+            addresses.append(ipaddress.ip_address(row[4][0]))
+        except (IndexError, TypeError, ValueError):
+            return False
+    return bool(addresses) and all(
+        isinstance(address, ipaddress.IPv4Address)
+        and address in _BENCHMARK_FAKE_IP_NETWORK
+        for address in addresses
+    )
+
+
+def _build_codex_config(options: DiagnosticOptions, paths: RunPaths) -> bool:
     worker_python, runtime_roots = _canonical_worker_runtime(options)
+    allow_local_binding = _uses_benchmark_fake_ip("test-api.feedling.app")
     bundle = write_codex_config.build_config_bundle(
         output=paths.codex_home / "config.toml",
         source_root=paths.worker_source_root,
@@ -1728,8 +1874,10 @@ def _build_codex_config(options: DiagnosticOptions, paths: RunPaths) -> None:
         runtime_read_roots=runtime_roots,
         worker_python=worker_python,
         qualification_mode="diagnostic",
+        allow_local_binding=allow_local_binding,
     )
     write_codex_config.write_bundle(paths.codex_home / "config.toml", bundle)
+    return allow_local_binding
 
 
 def _provision_diagnostic(
@@ -1945,6 +2093,110 @@ def _cot_delivery_passes(
     )
 
 
+def _profile_passes_before_parent_cleanup(
+    profile_result: Mapping[str, Any], profile_id: str
+) -> bool:
+    """Require every user-path scenario to pass plus the exact P0-13 deferral."""
+
+    scenarios = profile_result.get("scenarios")
+    return (
+        profile_result.get("profile_id") == profile_id
+        and profile_result.get("status") == "BLOCKED_EVIDENCE"
+        and isinstance(scenarios, list)
+        and len(scenarios) == 13
+        and [
+            row.get("scenario_id") if isinstance(row, Mapping) else None
+            for row in scenarios
+        ]
+        == [f"P0-{index:02d}" for index in range(1, 14)]
+        and all(
+            isinstance(row, Mapping) and row.get("status") == "PASS"
+            for row in scenarios[:12]
+        )
+        and parent_cleanup_is_deferred(profile_result)
+    )
+
+
+def _parent_cleanup_projection(
+    receipt: Mapping[str, Any] | None,
+    profile_ids: Sequence[str],
+    *,
+    required: bool,
+    manifest_profiles_validated: bool,
+) -> dict[str, Any]:
+    """Return an explicit, fail-closed view of deterministic parent cleanup."""
+
+    expected = list(profile_ids) if required else []
+    if not required:
+        return {
+            "owner": "deterministic_parent",
+            "status": "NOT_APPLICABLE",
+            "expected_profile_ids": expected,
+            "manifest_profiles_validated": False,
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        }
+
+    raw = receipt if isinstance(receipt, Mapping) else {}
+    attempted = raw.get("attempted")
+    cleaned = raw.get("cleaned")
+    failed = raw.get("failed_profile_ids")
+    manifest_deleted = raw.get("manifest_deleted")
+    manifest_missing = raw.get("manifest_missing")
+    failed_is_valid = (
+        isinstance(failed, list)
+        and all(isinstance(value, str) and value in expected for value in failed)
+        and len(failed) == len(set(failed))
+    )
+    exact = (
+        manifest_profiles_validated
+        and isinstance(attempted, int)
+        and not isinstance(attempted, bool)
+        and attempted == len(expected)
+        and isinstance(cleaned, int)
+        and not isinstance(cleaned, bool)
+        and cleaned == len(expected)
+        and failed_is_valid
+        and failed == []
+        and manifest_deleted is True
+        and manifest_missing is False
+    )
+    return {
+        "owner": "deterministic_parent",
+        "status": "PASS" if exact else "FAIL",
+        "expected_profile_ids": expected,
+        "manifest_profiles_validated": manifest_profiles_validated,
+        "attempted": attempted if type(attempted) is int and attempted >= 0 else None,
+        "cleaned": cleaned if type(cleaned) is int and cleaned >= 0 else None,
+        "failed_profile_ids": failed if failed_is_valid else [],
+        "manifest_deleted": manifest_deleted is True,
+        "manifest_missing": manifest_missing is True,
+    }
+
+
+def _diagnostic_profile_projection(
+    profile_results: Mapping[str, Mapping[str, Any]],
+    profile_ids: Sequence[str],
+    parent_cleanup: Mapping[str, Any],
+) -> dict[str, str]:
+    parent_passed = parent_cleanup.get("status") == "PASS"
+    return {
+        profile_id: (
+            "PASS"
+            if parent_passed
+            and isinstance(profile_results.get(profile_id), Mapping)
+            and _profile_passes_before_parent_cleanup(
+                profile_results[profile_id], profile_id
+            )
+            else "FAIL"
+        )
+        for profile_id in profile_ids
+    }
+
+
 def _safe_failure(exc: Exception) -> str:
     safe_types = (
         LocalDiagnosticError,
@@ -1954,6 +2206,7 @@ def _safe_failure(exc: Exception) -> str:
         write_codex_config.CodexConfigError,
         install_codex_auth.CodexAuthInstallError,
         harness_provenance.HarnessProvenanceError,
+        deployment_verifier.DeploymentVerificationError,
     )
     if isinstance(exc, safe_types):
         return str(exc)
@@ -1966,7 +2219,7 @@ def execute(
     dependencies: DiagnosticDependencies | None = None,
 ) -> tuple[dict[str, Any], Path]:
     dependencies = dependencies or DiagnosticDependencies()
-    if not _SHA_RE.fullmatch(options.candidate_sha):
+    if options.candidate_sha and not _SHA_RE.fullmatch(options.candidate_sha):
         raise LocalDiagnosticError(
             "candidate SHA must be 40 or 64 lowercase hex characters"
         )
@@ -1989,18 +2242,22 @@ def execute(
         "run_id": run_id,
         "target": "test",
         "base_url": LOCKED_BASE_URL,
-        "candidate_sha": options.candidate_sha,
+        "candidate_sha": options.candidate_sha or None,
         "codex_model": options.codex_model,
         "qualification_harness": None,
         "requested_profile_ids": list(options.profile_ids),
         "preflight_only": options.preflight_only,
         "status": "RUNNING",
         "profile_statuses": {},
+        "diagnostic_profile_statuses": {},
         "validated_credential_names": [],
         "codex_preflight": None,
+        "codex_network_profile": None,
+        "deployment_identity": None,
         "cot_delivery": {},
         "missing_strict_evidence": list(MISSING_STRICT_EVIDENCE),
         "cleanup": None,
+        "parent_cleanup_verification": None,
         "private_debug_retained": False,
         "private_debug_run_id": None,
         "private_cleanup_retry_retained": False,
@@ -2014,6 +2271,7 @@ def execute(
     failure: str | None = None
     cleanup_receipt: dict[str, Any] | None = None
     profile_results: dict[str, dict[str, Any]] = {}
+    manifest_profiles_validated = False
     try:
         summary["qualification_harness"] = dependencies.collect_harness_provenance(
             options.source_root
@@ -2024,6 +2282,49 @@ def execute(
             loaded, options.profile_ids, run_id
         )
         summary["validated_credential_names"] = list(credential_names)
+        deployment_receipt = dependencies.verify_deployment(
+            options.candidate_sha or None,
+            paths.deployment_receipt,
+            env=_deployment_environment(loaded),
+            expected_runtime=options.runtime_requirement,
+        )
+        observed_backend_sha = str(
+            deployment_receipt.get("observed_backend_sha") or ""
+        ).lower()
+        observed_deployment_sha = str(
+            deployment_receipt.get("observed_deployment_sha") or ""
+        ).lower()
+        resolved_candidate_sha = str(
+            deployment_receipt.get("expected_deployment_sha") or ""
+        ).lower()
+        observed_worker_sha = deployment_receipt.get("observed_worker_sha")
+        if (
+            not _SHA_RE.fullmatch(observed_backend_sha)
+            or resolved_candidate_sha != observed_backend_sha
+            or observed_deployment_sha != resolved_candidate_sha
+            or (
+                options.runtime_requirement == BASELINE_RUNTIME
+                and observed_worker_sha is not None
+            )
+            or (
+                options.runtime_requirement == RUNTIME_V2_RUNTIME
+                and observed_worker_sha != resolved_candidate_sha
+            )
+            or deployment_receipt.get("liveness_verified") is not True
+            or deployment_receipt.get("deployment_identity_verified") is not True
+        ):
+            raise LocalDiagnosticError(
+                "trusted deployment identity receipt is invalid"
+            )
+        options = replace(options, candidate_sha=resolved_candidate_sha)
+        summary["candidate_sha"] = resolved_candidate_sha
+        summary["deployment_identity"] = {
+            "expected_deployment_sha": resolved_candidate_sha,
+            "observed_backend_sha": observed_backend_sha,
+            "observed_deployment_sha": observed_deployment_sha,
+            "observed_worker_sha": observed_worker_sha,
+            "identity_verified": True,
+        }
         _verify_codex_location_separation(options.codex_bin, options, paths)
         dependencies.verify_codex_provenance(options.codex_bin)
         dependencies.verify_codex_version(options.codex_bin)
@@ -2050,7 +2351,12 @@ def execute(
             )
         harness["worker_snapshot_sha256"] = snapshot_sha256
         secret_values.extend(_fixture_privacy_values(paths.worker_source_root))
-        _build_codex_config(options, paths)
+        local_binding_enabled = _build_codex_config(options, paths)
+        summary["codex_network_profile"] = {
+            "allowed_host": "test-api.feedling.app",
+            "benchmark_fake_ip_detected": local_binding_enabled,
+            "allow_local_binding": local_binding_enabled,
+        }
         login_check = dependencies.verify_login or _verify_login
         login_check(
             options.codex_bin,
@@ -2068,6 +2374,7 @@ def execute(
             _validate_diagnostic_manifest(
                 manifest, options.profile_ids, options.runtime_requirement
             )
+            manifest_profiles_validated = True
             for row in manifest.get("profiles", []):
                 if isinstance(row, Mapping):
                     secret_values.extend(
@@ -2130,13 +2437,7 @@ def execute(
                     paths.profile_artifacts / f"{profile_id}.json", result
                 )
             summary["profile_statuses"] = statuses
-            summary["status"] = (
-                "DIAGNOSTIC_PASS"
-                if statuses
-                and set(statuses.values()) == {"PASS"}
-                and _cot_delivery_passes(summary["cot_delivery"], options.profile_ids)
-                else "DIAGNOSTIC_FAIL"
-            )
+            summary["status"] = "DIAGNOSTIC_FAIL"
     except Exception as exc:
         failure = _safe_failure(exc)
         summary["status"] = "DIAGNOSTIC_ERROR"
@@ -2156,17 +2457,59 @@ def execute(
                 "manifest_missing": manifest_missing,
             }
         summary["cleanup"] = cleanup_receipt
-        if cleanup_receipt.get("failed_profile_ids"):
+        cleanup_required = not options.preflight_only and manifest_profiles_validated
+        parent_cleanup = _parent_cleanup_projection(
+            cleanup_receipt,
+            options.profile_ids,
+            required=cleanup_required,
+            manifest_profiles_validated=manifest_profiles_validated,
+        )
+        summary["parent_cleanup_verification"] = parent_cleanup
+        summary["diagnostic_profile_statuses"] = (
+            _diagnostic_profile_projection(
+                profile_results,
+                options.profile_ids,
+                parent_cleanup,
+            )
+            if cleanup_required
+            else {}
+        )
+        cleanup_verification_failed = (
+            cleanup_required and parent_cleanup.get("status") != "PASS"
+        ) or bool(
+            isinstance(cleanup_receipt, Mapping)
+            and cleanup_receipt.get("failed_profile_ids")
+        )
+        if cleanup_verification_failed:
             summary["status"] = "CLEANUP_FAIL"
-            summary["error"] = "one or more synthetic accounts could not be cleaned"
+            summary["error"] = "deterministic parent cleanup could not be verified"
             failure = summary["error"]
+        elif cleanup_required and failure is None:
+            summary["status"] = (
+                "DIAGNOSTIC_PASS"
+                if summary["diagnostic_profile_statuses"]
+                and set(summary["diagnostic_profile_statuses"].values()) == {"PASS"}
+                and _cot_delivery_passes(
+                    summary["cot_delivery"], options.profile_ids
+                )
+                else "DIAGNOSTIC_FAIL"
+            )
 
     retain_debug = (
         worker_phase_started
         and not options.preflight_only
         and summary["status"] != "DIAGNOSTIC_PASS"
     )
-    cleanup_failed = bool(cleanup_receipt and cleanup_receipt.get("failed_profile_ids"))
+    cleanup_failed = bool(
+        (
+            summary.get("parent_cleanup_verification", {}).get("status") == "FAIL"
+            or (
+                isinstance(cleanup_receipt, Mapping)
+                and cleanup_receipt.get("failed_profile_ids")
+            )
+        )
+        and paths.manifest.exists()
+    )
     try:
         if cleanup_failed:
             _retain_cleanup_retry_manifest(paths)
@@ -2272,7 +2615,14 @@ def execute(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, default=Path(".env.test"))
-    parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument(
+        "--candidate-sha",
+        default="",
+        help=(
+            "optional full expected source SHA; omitted discovers the protected "
+            "test backend identity, while a supplied value must match it exactly"
+        ),
+    )
     parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL)
     parser.add_argument(
         "--codex-bin",

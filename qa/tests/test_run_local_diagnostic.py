@@ -18,6 +18,7 @@ from qa import run_local_diagnostic as local
 from qa import run_codex_profile_workers as workers
 from qa import verify_codex_orchestration as orchestration
 from qa import diagnostic_results
+from qa import validate_diagnostic_attempts as diagnostic_attempts
 
 
 def _write_private(path: Path, value: str) -> Path:
@@ -58,6 +59,52 @@ def _auth_document() -> dict:
     }
 
 
+def _parent_cleanup_deferred_profile(profile_id: str) -> dict:
+    scenarios = [
+        {"scenario_id": f"P0-{index:02d}", "status": "PASS"}
+        for index in range(1, 13)
+    ]
+    deferred_failure = dict(diagnostic_attempts.PARENT_CLEANUP_DEFERRED_FAILURE)
+    scenarios.append(
+        {
+            "scenario_id": "P0-13",
+            "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+            "attempts": 1,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+                    "failure": dict(deferred_failure),
+                }
+            ],
+            "assertions": {
+                "trace_stages_complete": True,
+                "trace_correlation_confirmed": True,
+                "latency_attributed": True,
+                "cleanup_confirmed": False,
+            },
+            "evidence_codes": [
+                "TRACE_CORRELATION_CONFIRMED",
+                "LATENCY_ATTRIBUTED",
+            ],
+            "failure": deferred_failure,
+        }
+    )
+    return {
+        "profile_id": profile_id,
+        "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+        "scenarios": scenarios,
+        "cleanup": {
+            "attempted": False,
+            "provider_config_deleted": False,
+            "account_reset": False,
+            "old_credential_rejected": False,
+            "status": diagnostic_attempts.PARENT_CLEANUP_DEFERRED_STATUS,
+        },
+        "diagnostic_codes": ["CLEANUP_FALLBACK_USED"],
+    }
+
+
 def _schema_instance(node: dict, definitions: dict) -> object:
     if "$ref" in node:
         return _schema_instance(
@@ -92,7 +139,10 @@ def _options(
     tmp_path: Path,
     *,
     preflight_only: bool,
-    env_text: str = "QA_GEMINI_API_KEY=gemini-sensitive-value\n",
+    env_text: str = (
+        "QA_GEMINI_API_KEY=gemini-sensitive-value\n"
+        "FEEDLING_ADMIN_TOKEN=test-admin-token\n"
+    ),
 ) -> local.DiagnosticOptions:
     source = tmp_path / "checkout"
     source.mkdir()
@@ -163,6 +213,35 @@ def _harness_provenance_receipt(_source_root: Path) -> dict:
             _source_root
         ),
     }
+
+
+def _deployment_verification(
+    expected_sha,
+    receipt_path,
+    *,
+    env,
+    expected_runtime,
+) -> dict:
+    assert env["QA_FEEDLING_BASE_URL"] == "https://test-api.feedling.app"
+    assert env["QA_TEST_ADMIN_TOKEN"]
+    sha = expected_sha or "a" * 40
+    receipt = {
+        "schema_version": 1,
+        "environment": "test",
+        "base_url": "https://test-api.feedling.app",
+        "expected_runtime": expected_runtime,
+        "expected_deployment_sha": sha,
+        "observed_backend_sha": sha,
+        "observed_deployment_sha": sha,
+        "observed_worker_sha": sha if expected_runtime == "hosted_resident" else None,
+        "live_worker_count": 1 if expected_runtime == "hosted_resident" else None,
+        "liveness_verified": True,
+        "deployment_identity_verified": True,
+        "verified_at": "2026-07-14T00:00:00+00:00",
+    }
+    local._write_private_json(receipt_path, receipt)
+    receipt_path.chmod(0o400)
+    return receipt
 
 
 def _fake_codex_package(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
@@ -290,6 +369,19 @@ def test_cli_runtime_v2_requirement_is_opt_in(tmp_path, monkeypatch):
     assert local._options(args).runtime_requirement == "hosted_resident"
 
 
+def test_cli_candidate_sha_is_optional_for_authoritative_discovery(
+    tmp_path, monkeypatch
+):
+    native = tmp_path / "verified-native-codex"
+    monkeypatch.setattr(
+        local, "_resolve_trusted_codex_binary", lambda _explicit: native
+    )
+
+    args = local._parser().parse_args(["--preflight-only"])
+
+    assert local._options(args).candidate_sha == ""
+
+
 def test_env_loader_requires_owner_only_mode_and_never_echoes_value(tmp_path):
     secret = "provider-super-sensitive-value"
     env_file = tmp_path / "external.env"
@@ -329,7 +421,8 @@ def test_repo_local_dotenv_is_excluded_from_worker_source_snapshot(tmp_path):
     )
     repo_env = _write_private(
         source / ".env.test",
-        "QA_GEMINI_API_KEY=repo-local-provider-secret\n",
+        "QA_GEMINI_API_KEY=repo-local-provider-secret\n"
+        "FEEDLING_ADMIN_TOKEN=test-admin-token\n",
     )
     (source / ".env.example").write_text(
         "QA_GEMINI_API_KEY=example-only\n", encoding="utf-8"
@@ -369,6 +462,7 @@ def test_repo_local_dotenv_is_excluded_from_worker_source_snapshot(tmp_path):
             "manifest_missing": True,
         },
         launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -414,6 +508,7 @@ def test_subset_run_scans_every_loaded_provider_credential(tmp_path, monkeypatch
             "manifest_missing": True,
         },
         launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -444,6 +539,7 @@ def test_private_finalization_failure_removes_entire_raw_run_root(
             "manifest_missing": True,
         },
         launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -486,7 +582,10 @@ def test_failed_public_artifact_scan_quarantines_original_files(
     options = _options(
         tmp_path,
         preflight_only=True,
-        env_text=f"QA_GEMINI_API_KEY={provider_secret}\n",
+        env_text=(
+            f"QA_GEMINI_API_KEY={provider_secret}\n"
+            "FEEDLING_ADMIN_TOKEN=test-admin-token\n"
+        ),
     )
     dependencies = local.DiagnosticDependencies(
         provision=lambda *_args, **_kwargs: pytest.fail("unexpected provision"),
@@ -498,6 +597,7 @@ def test_failed_public_artifact_scan_quarantines_original_files(
             "manifest_missing": True,
         },
         launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -620,6 +720,47 @@ def test_public_artifact_scan_reconstructs_split_json_secret(tmp_path):
         )
 
 
+def test_public_artifact_scan_reconstructs_padded_split_json_secret(tmp_path):
+    options = _options(tmp_path, preflight_only=True)
+    paths = local.create_run_paths(options, "scan-padded-split-json")
+    secret = "provider-secret-padded-across-fields"
+    destination = paths.profile_artifacts / "official-gemini.json"
+    local._write_private_json(
+        destination,
+        {
+            "first": f"prefix::{secret[:17]}::suffix",
+            "ignored": "fixed-safe-interleaved-value",
+            "second": f"prefix::{secret[17:]}::suffix",
+        },
+    )
+
+    with pytest.raises(local.LocalDiagnosticError):
+        local._scan_public_artifacts(
+            paths.artifact_root, [secret], ("official-gemini",)
+        )
+
+
+def test_public_artifact_scan_does_not_reorder_padded_fragments(tmp_path):
+    options = _options(tmp_path, preflight_only=True)
+    paths = local.create_run_paths(options, "scan-reordered-json")
+    secret = "provider-secret-reordered-near-miss"
+    split = len(secret) // 2
+    destination = paths.profile_artifacts / "official-gemini.json"
+    local._write_private_json(
+        destination,
+        {
+            # The private JSON writer sorts keys, so these names preserve the
+            # deliberately reversed fragment order on disk.
+            "a_second": f"prefix::{secret[split:]}::suffix",
+            "z_first": f"prefix::{secret[:split]}::suffix",
+        },
+    )
+
+    local._scan_public_artifacts(
+        paths.artifact_root, [secret], ("official-gemini",)
+    )
+
+
 def test_private_fallback_scrub_reconstructs_split_json_secret(tmp_path):
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
@@ -628,6 +769,24 @@ def test_private_fallback_scrub_reconstructs_split_json_secret(tmp_path):
     local._write_private_json(
         destination,
         {"first": secret[:20], "second": secret[20:]},
+    )
+
+    local._scrub_sensitive_material(root, [secret])
+
+    assert not destination.exists()
+
+
+def test_private_fallback_scrub_reconstructs_padded_split_json_secret(tmp_path):
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    secret = "provider-secret-padded-across-private-fields"
+    destination = root / "split.json"
+    local._write_private_json(
+        destination,
+        {
+            "first": f"prefix::{secret[:21]}::suffix",
+            "second": f"prefix::{secret[21:]}::suffix",
+        },
     )
 
     local._scrub_sensitive_material(root, [secret])
@@ -938,6 +1097,66 @@ def test_local_pass_requires_trusted_cot_delivery(override, expected):
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("attempted", 0),
+        ("cleaned", 0),
+        ("failed_profile_ids", ["official-gemini"]),
+        ("manifest_deleted", False),
+        ("manifest_missing", True),
+    ),
+)
+def test_parent_cleanup_projection_rejects_inexact_receipt(field, value):
+    receipt = {
+        "attempted": 1,
+        "cleaned": 1,
+        "failed_profile_ids": [],
+        "manifest_deleted": True,
+        "manifest_missing": False,
+    }
+    receipt[field] = value
+
+    projection = local._parent_cleanup_projection(
+        receipt,
+        ("official-gemini",),
+        required=True,
+        manifest_profiles_validated=True,
+    )
+
+    assert projection["status"] == "FAIL"
+
+
+def test_parent_finalization_rejects_arbitrary_nonpass_or_agent_side_cleanup():
+    profile = _parent_cleanup_deferred_profile("official-gemini")
+    parent_cleanup = local._parent_cleanup_projection(
+        {
+            "attempted": 1,
+            "cleaned": 1,
+            "failed_profile_ids": [],
+            "manifest_deleted": True,
+            "manifest_missing": False,
+        },
+        ("official-gemini",),
+        required=True,
+        manifest_profiles_validated=True,
+    )
+    assert local._diagnostic_profile_projection(
+        {"official-gemini": profile}, ("official-gemini",), parent_cleanup
+    ) == {"official-gemini": "PASS"}
+
+    profile["scenarios"][-1]["failure"]["failure_code"] = "CLEANUP_FAILED"
+    assert local._diagnostic_profile_projection(
+        {"official-gemini": profile}, ("official-gemini",), parent_cleanup
+    ) == {"official-gemini": "FAIL"}
+
+    profile = _parent_cleanup_deferred_profile("official-gemini")
+    profile["cleanup"]["attempted"] = True
+    assert local._diagnostic_profile_projection(
+        {"official-gemini": profile}, ("official-gemini",), parent_cleanup
+    ) == {"official-gemini": "FAIL"}
+
+
 def test_local_auth_is_validated_and_copied_privately(tmp_path):
     source = _write_private(
         tmp_path / "source-auth.json", json.dumps(_auth_document()) + "\n"
@@ -958,15 +1177,15 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
     options = local._resolve_runtime_options(_options(tmp_path, preflight_only=True))
     paths = local.create_run_paths(options, "local-preflight-unit")
     local._build_codex_config(options, paths)
-    observed: dict = {}
+    observed: dict = {"sandbox_commands": [], "sandbox_environments": []}
     real_run = local.subprocess.run
 
     def run(command, **kwargs):
         if command[1] == "-c":
             return real_run(command, **kwargs)
         if command[1] == "sandbox":
-            observed["sandbox_command"] = tuple(command)
-            observed["sandbox_environment"] = dict(kwargs["env"])
+            observed["sandbox_commands"].append(tuple(command))
+            observed["sandbox_environments"].append(dict(kwargs["env"]))
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         observed["command"] = tuple(command)
         observed["environment"] = dict(kwargs["env"])
@@ -1019,7 +1238,9 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
     assert receipt["headless_exec_completed"] is True
     assert receipt["tool_calls_observed"] is False
     assert receipt["worker_runtime_valid"] is True
-    sandbox_command = observed["sandbox_command"]
+    assert receipt["worker_network_valid"] is True
+    assert len(observed["sandbox_commands"]) == 2
+    sandbox_command = observed["sandbox_commands"][0]
     assert sandbox_command[1:6] == (
         "sandbox",
         "-p",
@@ -1029,8 +1250,48 @@ def test_headless_preflight_uses_isolated_oauth_model_and_forbids_tools(
     )
     assert sandbox_command[-1].endswith("/qa/cot_delivery_probe.py")
     assert 'exec "$QA_PYTHON_BIN" -I -B "$2" --help' in sandbox_command[-4]
-    assert observed["sandbox_environment"]["QA_PYTHON_BIN"] == sandbox_command[-2]
-    assert observed["sandbox_environment"]["QA_QUALIFICATION_MODE"] == "diagnostic"
+    runtime_environment = observed["sandbox_environments"][0]
+    assert runtime_environment["QA_PYTHON_BIN"] == sandbox_command[-2]
+    assert runtime_environment["QA_QUALIFICATION_MODE"] == "diagnostic"
+    network_command = observed["sandbox_commands"][1]
+    assert network_command[1:6] == (
+        "sandbox",
+        "-p",
+        "profile_official_gemini",
+        "-P",
+        "feedling-e2e-official-gemini",
+    )
+    assert network_command[-1] == "https://test-api.feedling.app/healthz"
+    assert "urllib.request.urlopen" in network_command[-2]
+
+
+def test_benchmark_fake_ip_detection_is_narrow(monkeypatch):
+    def rows(addresses):
+        return [
+            (local.socket.AF_INET, local.socket.SOCK_STREAM, 6, "", (address, 443))
+            for address in addresses
+        ]
+
+    monkeypatch.setattr(
+        local.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: rows(["198.18.0.137", "198.19.255.254"]),
+    )
+    assert local._uses_benchmark_fake_ip("test-api.feedling.app") is True
+
+    monkeypatch.setattr(
+        local.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: rows(["198.18.0.137", "203.0.113.7"]),
+    )
+    assert local._uses_benchmark_fake_ip("test-api.feedling.app") is False
+
+    monkeypatch.setattr(
+        local.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: rows(["10.0.0.7"]),
+    )
+    assert local._uses_benchmark_fake_ip("test-api.feedling.app") is False
 
 
 def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
@@ -1064,6 +1325,10 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
         provision=unexpected,
         cleanup=cleanup,
         launch=unexpected,
+        verify_deployment=lambda *args, **kwargs: (
+            trust_order.append("deployment")
+            or _deployment_verification(*args, **kwargs)
+        ),
         verify_codex_provenance=lambda _path: trust_order.append("provenance"),
         verify_codex_version=lambda _path: trust_order.append("version"),
         verify_login=lambda *_args: None,
@@ -1074,7 +1339,7 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
     summary, summary_path = local.execute(options, dependencies=dependencies)
 
     assert summary["status"] == "PREFLIGHT_PASS"
-    assert trust_order == ["provenance", "version", "oauth_install"]
+    assert trust_order == ["deployment", "provenance", "version", "oauth_install"]
     assert summary["release_qualified"] is False
     assert summary["requested_profile_ids"] == ["official-gemini"]
     expected_harness = _harness_provenance_receipt(options.source_root)
@@ -1103,6 +1368,111 @@ def test_preflight_creates_sanitized_non_release_artifact_and_calls_cleanup(
     assert "gemini-sensitive-value" not in summary_path.read_text()
 
 
+def test_preflight_discovers_authoritative_deployment_sha_before_codex(tmp_path):
+    discovered_sha = "d" * 40
+    options = replace(
+        _options(tmp_path, preflight_only=True),
+        candidate_sha="",
+    )
+    order: list[str] = []
+
+    def verify_deployment(expected_sha, receipt_path, *, env, expected_runtime):
+        order.append("deployment")
+        assert expected_sha is None
+        assert env == {
+            "QA_FEEDLING_BASE_URL": "https://test-api.feedling.app",
+            "QA_TEST_ADMIN_TOKEN": "test-admin-token",
+        }
+        receipt = {
+            "schema_version": 1,
+            "environment": "test",
+            "base_url": "https://test-api.feedling.app",
+            "expected_runtime": expected_runtime,
+            "expected_deployment_sha": discovered_sha,
+            "observed_backend_sha": discovered_sha,
+            "observed_deployment_sha": discovered_sha,
+            "observed_worker_sha": None,
+            "live_worker_count": None,
+            "liveness_verified": True,
+            "deployment_identity_verified": True,
+            "verified_at": "2026-07-14T00:00:00+00:00",
+        }
+        local._write_private_json(receipt_path, receipt)
+        receipt_path.chmod(0o400)
+        return receipt
+
+    dependencies = local.DiagnosticDependencies(
+        provision=lambda *_args, **_kwargs: pytest.fail("unexpected provision"),
+        cleanup=lambda *_args, **_kwargs: {
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        },
+        launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=verify_deployment,
+        verify_codex_provenance=lambda _path: order.append("codex"),
+        verify_codex_version=lambda _path: None,
+        verify_login=lambda *_args: None,
+        verify_codex_exec=_codex_preflight_receipt,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    summary, _summary_path = local.execute(options, dependencies=dependencies)
+
+    assert order[:2] == ["deployment", "codex"]
+    assert summary["candidate_sha"] == discovered_sha
+    assert summary["deployment_identity"] == {
+        "expected_deployment_sha": discovered_sha,
+        "observed_backend_sha": discovered_sha,
+        "observed_deployment_sha": discovered_sha,
+        "observed_worker_sha": None,
+        "identity_verified": True,
+    }
+
+
+def test_candidate_sha_mismatch_aborts_before_codex_or_provisioning(tmp_path):
+    options = _options(tmp_path, preflight_only=False)
+    downstream_called = False
+
+    def unexpected(*_args, **_kwargs):
+        nonlocal downstream_called
+        downstream_called = True
+        raise AssertionError("deployment mismatch must stop the run")
+
+    def reject_mismatch(expected_sha, _receipt_path, *, env, expected_runtime):
+        assert expected_sha == "a" * 40
+        assert env["QA_TEST_ADMIN_TOKEN"] == "test-admin-token"
+        assert expected_runtime == "deployed_current"
+        raise local.deployment_verifier.DeploymentVerificationError(
+            "deployed backend build does not match the candidate"
+        )
+
+    dependencies = local.DiagnosticDependencies(
+        provision=unexpected,
+        cleanup=lambda *_args, **_kwargs: {
+            "attempted": 0,
+            "cleaned": 0,
+            "failed_profile_ids": [],
+            "manifest_deleted": False,
+            "manifest_missing": True,
+        },
+        launch=unexpected,
+        verify_deployment=reject_mismatch,
+        verify_codex_provenance=unexpected,
+        verify_codex_version=unexpected,
+        verify_login=unexpected,
+        verify_codex_exec=unexpected,
+        collect_harness_provenance=_harness_provenance_receipt,
+    )
+
+    with pytest.raises(local.LocalDiagnosticError, match="does not match"):
+        local.execute(options, dependencies=dependencies)
+
+    assert downstream_called is False
+
+
 def test_harness_provenance_failure_aborts_before_provisioning(tmp_path):
     options = _options(tmp_path, preflight_only=False)
     provision_called = False
@@ -1127,6 +1497,7 @@ def test_harness_provenance_failure_aborts_before_provisioning(tmp_path):
             "manifest_missing": True,
         },
         launch=lambda *_args, **_kwargs: pytest.fail("unexpected launch"),
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: pytest.fail(
             "unexpected Codex provenance check"
         ),
@@ -1166,6 +1537,8 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         assert profile_ids == ("official-gemini",)
         assert runtime_requirement == "deployed_current"
         assert env["QA_GEMINI_API_KEY"] == "gemini-sensitive-value"
+        assert "QA_TEST_ADMIN_TOKEN" not in env
+        assert "FEEDLING_ADMIN_TOKEN" not in env
         manifest = {
             "schema_version": 1,
             "qualification_mode": "diagnostic",
@@ -1194,17 +1567,11 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         )
         assert isolated["selected_profile_ids"] == ["official-gemini"]
         assert len(isolated["profiles"]) == 1
-        local._write_private_json(
-            kwargs["aggregation_input_root"] / "official-gemini.json",
+        profile = _parent_cleanup_deferred_profile("official-gemini")
+        profile.update(
             {
-                "profile_id": "official-gemini",
-                "status": "PASS",
                 "observed_runtime": "hosted_resident",
                 "observed_runtime_version": 2,
-                "scenarios": [
-                    {"scenario_id": f"P0-{index:02d}", "status": "PASS"}
-                    for index in range(1, 14)
-                ],
                 "latency": {
                     "sample_count": 3,
                     "ack_p50_ms": 12,
@@ -1226,7 +1593,11 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
                     "reasoning_token_count": 192,
                     "user_visible_disclosure_present": True,
                 },
-            },
+            }
+        )
+        local._write_private_json(
+            kwargs["aggregation_input_root"] / "official-gemini.json",
+            profile,
         )
         return {
             "launch_attempts": 1,
@@ -1275,6 +1646,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         provision=provision,
         cleanup=cleanup,
         launch=launch,
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -1287,7 +1659,28 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
     assert calls == ["provision", "launch", "cleanup"]
     assert summary["status"] == "DIAGNOSTIC_PASS"
     assert summary["release_qualified"] is False
-    assert summary["profile_statuses"] == {"official-gemini": "PASS"}
+    assert summary["deployment_identity"] == {
+        "expected_deployment_sha": "a" * 40,
+        "observed_backend_sha": "a" * 40,
+        "observed_deployment_sha": "a" * 40,
+        "observed_worker_sha": None,
+        "identity_verified": True,
+    }
+    assert summary["profile_statuses"] == {
+        "official-gemini": "BLOCKED_EVIDENCE"
+    }
+    assert summary["diagnostic_profile_statuses"] == {"official-gemini": "PASS"}
+    assert summary["parent_cleanup_verification"] == {
+        "owner": "deterministic_parent",
+        "status": "PASS",
+        "expected_profile_ids": ["official-gemini"],
+        "manifest_profiles_validated": True,
+        "attempted": 1,
+        "cleaned": 1,
+        "failed_profile_ids": [],
+        "manifest_deleted": True,
+        "manifest_missing": False,
+    }
     assert summary["orchestration"]["completed_command_execution_counts"] == {
         "official-gemini": 13
     }
@@ -1315,12 +1708,20 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         "receipt_sha256": "a" * 64,
     }
     profile = summary_path.parent / "profiles" / "official-gemini.json"
-    assert json.loads(profile.read_text())["status"] == "PASS"
+    stored_profile = json.loads(profile.read_text())
+    assert stored_profile["status"] == "BLOCKED_EVIDENCE"
+    assert stored_profile["scenarios"][-1]["status"] == "BLOCKED_EVIDENCE"
+    assert stored_profile["scenarios"][-1]["assertions"]["cleanup_confirmed"] is False
     assert "official-gemini" in (summary_path.parent / "matrix.md").read_text()
     assert "release_qualified" in (summary_path.parent / "latency.csv").read_text()
     latency = (summary_path.parent / "latency.csv").read_text()
-    assert "official-gemini,PASS,3,12,345,678,1,2,300,20,22,,false" in latency
+    assert (
+        "official-gemini,BLOCKED_EVIDENCE,3,12,345,678,1,2,300,20,22,,false"
+        in latency
+    )
     matrix = (summary_path.parent / "matrix.md").read_text()
+    assert "Deterministic parent cleanup: `PASS`" in matrix
+    assert "Parent-finalized profiles: `1/1`" in matrix
     assert (
         "PASS | NONE | PASS | NONE | OBSERVED | PRESENT | PRESENT | PRESENT"
         in matrix
@@ -1454,6 +1855,7 @@ def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_p
         provision=provision,
         cleanup=cleanup,
         launch=launch,
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -1577,6 +1979,7 @@ def test_cleanup_failure_retains_retry_manifest_but_removes_oauth_material(tmp_p
         provision=provision,
         cleanup=cleanup,
         launch=launch,
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,
@@ -1713,6 +2116,7 @@ def test_cleanup_runs_after_provisioning_failure_and_failure_stays_sanitized(tmp
         provision=provision,
         cleanup=cleanup,
         launch=lambda **_kwargs: {},
+        verify_deployment=_deployment_verification,
         verify_codex_provenance=lambda _path: None,
         verify_codex_version=lambda _path: None,
         verify_login=lambda *_args: None,

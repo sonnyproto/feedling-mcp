@@ -2,6 +2,7 @@ import base64
 import json
 import secrets
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -390,6 +391,28 @@ def test_send_then_qualification_poll_uses_cached_exact_turn_id(monkeypatch):
     assert calls[1][0] == "GET"
     assert "since=9.999000" in calls[1][1]
     assert "limit=200" in calls[1][1]
+
+
+def test_send_does_not_replay_post_when_response_is_lost():
+    sess = _session()
+    smoke = client.SmokeClient("https://example.test")
+
+    class LostResponseOpener:
+        def __init__(self):
+            self.calls = 0
+
+        def open(self, request, timeout):  # noqa: ANN001, ARG002
+            self.calls += 1
+            raise urllib.error.URLError("response lost after server accepted request")
+
+    opener = LostResponseOpener()
+    smoke._opener = opener
+
+    with pytest.raises(client.SmokeError, match="failed after 1 tries") as exc:
+        smoke.send(sess, "hello")
+
+    assert exc.value.stage == "network"
+    assert opener.calls == 1
 
 
 @pytest.mark.parametrize(

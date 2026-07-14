@@ -15,13 +15,16 @@ for the once-per-master items). Reconciliation table (plan §8.1 / §3.3):
 | async poll-waiter wake hook (§9.3/§19.2)    | this lifespan (always) — inject registry.wake|
 | `core_wake_bus.start_listener()`            | this lifespan (always — cross-worker poll wake)|
 | `core_leader.run_singleton("ws", ...)`      | this lifespan (gated: FEEDLING_ASGI_BACKGROUND)|
+| `core_leader.run_singleton("qa-synthetic-reaper", ...)` | this lifespan (gated: QA env)|
 
 Only the :9998 WS-leader election is gated OFF by default, so the dev-time
 parallel instance (:5005, plan §8) sharing the live backend's DB does not
 contend for WS leadership. The wake-bus listener IS started (it is a per-worker
 LISTEN by design and is REQUIRED for cross-worker/cross-process poll wakes —
 without it a native poll on the ASGI instance would miss writes made on another
-process). See asgi.settings.
+process). The DB-only synthetic-account reaper is independently gated by its
+test-only opt-in and can therefore enforce cleanup even when external-binding
+background services are disabled. See asgi.settings.
 """
 
 from __future__ import annotations
@@ -60,6 +63,14 @@ def _start_tee_sync_leader() -> None:
     from core import leader as core_leader
 
     core_leader.run_singleton("tee-sync", tee_sync_scheduler.start)
+
+
+def _start_qa_synthetic_reaper_leader() -> None:
+    """Test-only synthetic-account janitor, elected across all workers."""
+    from admin import qa_synthetic_accounts
+    from core import leader as core_leader
+
+    core_leader.run_singleton("qa-synthetic-reaper", qa_synthetic_accounts.start)
 
 
 @asynccontextmanager
@@ -127,6 +138,16 @@ async def lifespan(app):
 
         if _tee_mirror.enabled():
             _start_tee_sync_leader()
+
+    # Explicitly opt-in on the test backend only. Unlike the external-binding
+    # WS service, this DB-elected janitor is safe to run when general ASGI
+    # background services are off. Keeping it independent prevents an enabled
+    # registration surface from existing without any process even attempting
+    # cleanup; registration additionally requires a fresh persisted heartbeat.
+    from admin import qa_synthetic_accounts as _qa_synthetic_accounts
+
+    if _qa_synthetic_accounts.config()["enabled"]:
+        _start_qa_synthetic_reaper_leader()
 
     print(
         f"[asgi] startup ready: threadpool={settings.db_threads} "

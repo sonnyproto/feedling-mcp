@@ -8,6 +8,13 @@ from typing import Any, Mapping
 
 SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(1, 14))
 LIVE_SCENARIO_IDS = SCENARIO_IDS[1:12]
+PARENT_CLEANUP_DEFERRED_STATUS = "BLOCKED_EVIDENCE"
+PARENT_CLEANUP_DEFERRED_FAILURE = {
+    "category": PARENT_CLEANUP_DEFERRED_STATUS,
+    "stage_code": "CLEANUP",
+    "failure_code": "PRECONDITION_MISSING",
+    "reproducible": True,
+}
 
 
 class DiagnosticAttemptError(RuntimeError):
@@ -19,6 +26,64 @@ def _failure_code(value: Any) -> str:
         return ""
     code = value.get("failure_code")
     return str(code) if isinstance(code, str) else ""
+
+
+def parent_cleanup_is_deferred(profile_result: Mapping[str, Any]) -> bool:
+    """Recognize the one allowed agent-side result before parent cleanup.
+
+    The local diagnostic worker must leave the synthetic account alive so the
+    deterministic parent can perform and verify the sole account reset.  This
+    predicate is intentionally exact: it cannot turn an arbitrary non-passing
+    P0-13 result into a diagnostic success.
+    """
+
+    scenarios = profile_result.get("scenarios")
+    cleanup = profile_result.get("cleanup")
+    diagnostic_codes = profile_result.get("diagnostic_codes")
+    if (
+        not isinstance(scenarios, list)
+        or len(scenarios) != len(SCENARIO_IDS)
+        or not isinstance(cleanup, Mapping)
+        or not isinstance(diagnostic_codes, list)
+        or "CLEANUP_FALLBACK_USED" not in diagnostic_codes
+    ):
+        return False
+
+    scenario = scenarios[-1]
+    if not isinstance(scenario, Mapping) or scenario.get("scenario_id") != "P0-13":
+        return False
+    assertions = scenario.get("assertions")
+    attempts = scenario.get("attempt_results")
+    evidence_codes = scenario.get("evidence_codes")
+    if (
+        scenario.get("status") != PARENT_CLEANUP_DEFERRED_STATUS
+        or scenario.get("attempts") != 1
+        or not isinstance(assertions, Mapping)
+        or assertions.get("trace_stages_complete") is not True
+        or assertions.get("trace_correlation_confirmed") is not True
+        or assertions.get("latency_attributed") is not True
+        or assertions.get("cleanup_confirmed") is not False
+        or scenario.get("failure") != PARENT_CLEANUP_DEFERRED_FAILURE
+        or not isinstance(attempts, list)
+        or len(attempts) != 1
+        or not isinstance(attempts[0], Mapping)
+        or attempts[0].get("attempt") != 1
+        or attempts[0].get("status") != PARENT_CLEANUP_DEFERRED_STATUS
+        or attempts[0].get("failure") != PARENT_CLEANUP_DEFERRED_FAILURE
+        or not isinstance(evidence_codes, list)
+        or not {"TRACE_CORRELATION_CONFIRMED", "LATENCY_ATTRIBUTED"}.issubset(
+            evidence_codes
+        )
+    ):
+        return False
+
+    return (
+        cleanup.get("attempted") is False
+        and cleanup.get("provider_config_deleted") is False
+        and cleanup.get("account_reset") is False
+        and cleanup.get("old_credential_rejected") is False
+        and cleanup.get("status") == PARENT_CLEANUP_DEFERRED_STATUS
+    )
 
 
 def validate_live_attempts(profile_result: Mapping[str, Any]) -> None:
@@ -80,3 +145,7 @@ def validate_live_attempts(profile_result: Mapping[str, Any]) -> None:
                 f"diagnostic scenario {scenario_id} propagated a preflight blocker"
             )
 
+    if not parent_cleanup_is_deferred(profile_result):
+        raise DiagnosticAttemptError(
+            "diagnostic scenario P0-13 is not the fixed parent-cleanup deferral"
+        )

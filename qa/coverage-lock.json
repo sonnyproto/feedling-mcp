@@ -226,11 +226,15 @@
     },
     "P0-06": {
       "required_assertions": [
+        "persona_files_archived",
+        "persona_source_metadata_verified",
         "persona_import_done",
         "persona_acceptance_passed",
         "privacy_canary_absent"
       ],
       "required_evidence_codes": [
+        "PERSONA_FILES_ARCHIVED",
+        "PERSONA_SOURCE_METADATA_VERIFIED",
         "PERSONA_IMPORT_DONE",
         "PERSONA_ACCEPTANCE_PASSED",
         "PRIVACY_CANARY_ABSENT"
@@ -414,10 +418,32 @@
     "user_visible_disclosure_required_when_expected": true,
     "raw_private_chain_of_thought_forbidden": true
   },
+  "deterministic_contracts": {
+    "memory": {
+      "profile_id": "memory-contract",
+      "receipt_schema": "qa/schemas/memory-contract-receipt.schema.json",
+      "always_required_checks": [
+        "fresh_empty_recall",
+        "encrypted_v1_index_fetch",
+        "quiet_window_capture_write",
+        "route_chat_message_trace",
+        "capture_noop_disposable_chitchat",
+        "duplicate_fact_no_growth",
+        "local_only_exclusion",
+        "supersede_visibility"
+      ],
+      "migration_checks": [
+        "legacy_migration_stable_id",
+        "stale_cas_preserves_concurrent_updates"
+      ],
+      "migration_policy": "allow_not_exercised_when_disabled"
+    }
+  },
   "artifact_contract": {
     "schema": "qa/schemas/run-result.schema.json",
     "required": [
       "run-result.json",
+      "memory-contract.json",
       "matrix.md",
       "latency.csv",
       "junit.xml",
