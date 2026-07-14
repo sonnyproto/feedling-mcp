@@ -608,3 +608,28 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     row = data_track._build_data_track_user(user_entry, include_detail=True)
 
     assert row["runtime"]["reasoning_effort"] == "medium"
+
+
+def test_perception_permissions_block_renders_granted_denied_and_switches():
+    # The user-detail page shows a readable 感知授权 & 主动开关 block so "can't use
+    # album/screen" is answerable on sight (granted vs not vs unknown).
+    user = {
+        "perception_permissions": {
+            "permission_states": {"photos": "authorized", "screen": "denied", "location": "notDetermined"},
+            "switches": {"photo_wake_照片唤醒": True, "screen_watch_屏幕观察": False},
+            "wake_directive": "晚上少打扰",
+            "wake_interval_sec": 7200,
+        }
+    }
+    out = _dt._render_perception_permissions(user)
+    assert "photos" in out and "已授权" in out          # granted
+    assert "screen" in out and "未授权" in out           # denied
+    assert "location" in out and "notDetermined" in out  # unknown -> raw state shown
+    assert "photo_wake_照片唤醒" in out and "开" in out
+    assert "screen_watch_屏幕观察" in out and "关" in out
+    assert "晚上少打扰" in out                            # wake directive
+    # empty permission_states -> explicit "no report" hint, not silence
+    empty = _dt._render_perception_permissions({"perception_permissions": {"permission_states": {}, "switches": {}}})
+    assert "permission_states 为空" in empty
+    # no block at all when the user has no perception_permissions key
+    assert _dt._render_perception_permissions({}) == ""

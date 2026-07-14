@@ -1038,6 +1038,29 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     }
     if include_detail:
         row["runtime"] = _runtime_summary(store)
+        _ps = store.load_proactive_settings()
+        row["perception_permissions"] = {
+            # what the device reports it granted (free-form; keys are app-defined,
+            # e.g. photos / screen / location / health / motion / calendar / audio)
+            "permission_states": dict(_ps.get("permission_states") or {}),
+            # per-user autonomy switches (all default on)
+            "switches": {
+                "ambient_陪伴": bool(_ps.get("enabled", True)),
+                "dnd_勿扰": bool(_ps.get("dnd", False)),
+                "scheduled_定时": bool(_ps.get("scheduled", True)),
+                "dream_做梦": bool(_ps.get("dream_enabled", True)),
+                "capture_记忆整理": bool(_ps.get("capture_enabled", True)),
+                "screen_watch_屏幕观察": bool(_ps.get("screen_watch_enabled", True)),
+                "photo_wake_照片唤醒": bool(_ps.get("photo_wake_enabled", True)),
+                "arrival_wake_到达唤醒": bool(_ps.get("arrival_wake_enabled", True)),
+                "unlock_wake_解锁唤醒": bool(_ps.get("unlock_wake_enabled", True)),
+            },
+            "wake_directive": str(_ps.get("wake_directive") or ""),
+            "wake_interval_sec": int(_ps.get("wake_interval_sec") or 0),
+            "user_state": _ps.get("user_state"),
+            "ai_state": _ps.get("ai_state"),
+            "broadcast_state": _ps.get("broadcast_state"),
+        }
         row["identity"] = {
             "written": identity is not None,
             "updated_at": identity_updated_at,
@@ -3103,6 +3126,43 @@ def _render_event_users_page(payload: dict) -> str:
 </main></body></html>"""
 
 
+def _render_perception_permissions(user: dict) -> str:
+    """Readable 感知授权 & 主动开关 block for the user detail page — so 'can't use
+    album/screen' can be answered on sight (granted vs not vs unknown)."""
+    pp = user.get("perception_permissions")
+    if not isinstance(pp, dict):
+        return ""
+
+    def _perm_pill(label, state):
+        s = str(state).strip().lower()
+        if s in ("authorized", "granted", "true", "on", "1", "yes", "allowed", "full", "limited"):
+            cls, txt = "ppok", ("已授权" if s != "limited" else "部分授权")
+        elif s in ("denied", "restricted", "false", "off", "0", "no", "blocked"):
+            cls, txt = "ppbad", "未授权"
+        else:
+            cls, txt = "ppmuted", (str(state) or "未知")
+        return f"<span class='pp-item'>{html.escape(str(label))} <b class='{cls}'>{html.escape(txt)}</b></span>"
+
+    perm = pp.get("permission_states") if isinstance(pp.get("permission_states"), dict) else {}
+    perm_html = (
+        "".join(_perm_pill(k, v) for k, v in perm.items())
+        or "<span class='ppmuted'>permission_states 为空——设备没上报任何感知授权（可能未授权，也可能这版 app 没上报此字段）</span>"
+    )
+    sw = pp.get("switches") if isinstance(pp.get("switches"), dict) else {}
+    sw_html = "".join(
+        f"<span class='pp-item'>{html.escape(str(k))} <b class='{'ppok' if v else 'ppmuted'}'>{'开' if v else '关'}</b></span>"
+        for k, v in sw.items()
+    )
+    directive = str(pp.get("wake_directive") or "").strip()
+    directive_html = f"<div class='ppmuted' style='margin-top:6px'>wake 指令：{html.escape(directive)}</div>" if directive else ""
+    return (
+        "<h2 style='font-size:15px;margin:22px 0 6px'>感知授权 &amp; 主动开关</h2>"
+        "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>感知授权=设备上报的各感知权限（相册/屏幕/位置/健康…）；开关=用户自己的主动/自主开关。</div>"
+        f"<div class='pp-box'><b>感知授权</b><br>{perm_html}</div>"
+        f"<div class='pp-box'><b>主动开关</b><br>{sw_html}{directive_html}</div>"
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -3125,6 +3185,9 @@ def _render_user_detail_page(user: dict) -> str:
     .value {{ font-size:22px; font-weight:700; }}
     .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .pp-box {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:8px 0; font-size:13px; line-height:2; }}
+    .pp-item {{ display:inline-block; margin:0 14px 4px 0; }}
+    .ppok {{ color:#1d7a4d; }} .ppbad {{ color:#b7352b; }} .ppmuted {{ color:var(--muted); }}
   </style>
 </head>
 <body>
@@ -3140,6 +3203,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
   </section>
+  {_render_perception_permissions(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>
   <pre>{html.escape(safe_json)}</pre>
 </main>
