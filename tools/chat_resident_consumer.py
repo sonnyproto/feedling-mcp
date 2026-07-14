@@ -2345,7 +2345,7 @@ def _looks_like_agent_protocol_text(text: str) -> bool:
         stripped = fence.group(1).strip()
     if stripped.lower().startswith("json\n"):
         stripped = stripped[5:].strip()
-    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"')
+    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"', '"cards"')
     if not any(key in stripped for key in protocol_keys):
         return False
     # A bare protocol fragment is a key immediately followed by a colon
@@ -2588,11 +2588,14 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if marker in _JSON_NON_FINAL_EVENTS:
         return turn
 
-    # Capture-lane agents are asked to return a strict {"cards": [...]} JSON
-    # object. Preserve that JSON as the final text so the capture handler can
-    # parse it instead of treating it as an unknown non-chat payload.
+    # A {"cards": [...]} object is capture/dream-lane protocol, never a chat
+    # reply. Background lanes read the model's literal output (raw_text paths:
+    # _extract_text_from_cli_output / _raw_assistant_text plus the explicit
+    # bare-cards handling in _call_agent_http_simple) and never come through
+    # this parser — so here it can only be a chat/proactive turn echoing the
+    # capture format (e.g. after a capture turn in the shared --resume
+    # session). Drop it like any other agent-protocol payload.
     if isinstance(obj.get("cards"), list):
-        turn.messages.append(json.dumps({"cards": obj.get("cards")}, ensure_ascii=False))
         return turn
 
     # OpenClaw `agent --json` nests reply text under result.payloads[].text,
@@ -3244,6 +3247,11 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         text = _raw_assistant_text(body)
         if text.strip():
             return text
+        # Capture/dream lanes may get a bare {"cards": [...]} body with no reply
+        # field. Hand it back serialized — the shared turn parser deliberately
+        # drops the cards shape (chat-protocol guard), so it can't recover it.
+        if isinstance(body, dict) and isinstance(body.get("cards"), list):
+            return json.dumps({"cards": body.get("cards")}, ensure_ascii=False)
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
         if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:

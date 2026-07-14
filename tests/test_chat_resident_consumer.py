@@ -3636,6 +3636,62 @@ def test_agent_turn_drops_bare_messages_protocol_fragment_with_space_before_colo
     assert turn.messages == []
 
 
+def test_agent_turn_drops_capture_cards_json_on_chat_lane():
+    # A capture-format {"cards": [...]} object is background-lane protocol, not a
+    # chat reply. When the model echoes it in a chat/proactive turn (e.g. after a
+    # capture turn polluted the shared --resume session) it must be dropped, not
+    # rendered as a bubble — the raw_text lanes read the model's literal output
+    # and never come through this parser.
+    assert crc._agent_turn_from_raw({"cards": []}).messages == []
+    assert crc._split_agent_turn('{"cards": []}').messages == []
+
+    raw = '{"cards": [{"action": "add", "summary": "s", "content": "c"}]}'
+    assert crc._split_agent_turn(raw).messages == []
+
+
+def test_agent_turn_drops_truncated_cards_protocol_fragment():
+    # Malformed/truncated cards JSON can't be parsed into a dict, so it falls to
+    # the string-path protocol guard — which must recognize the "cards" key.
+    assert crc._looks_like_agent_protocol_text('{"cards": [')
+    assert crc._split_agent_turn('{"cards": [{"action": "add"').messages == []
+
+
+def test_process_proactive_cards_json_reply_does_not_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: '{"cards": []}',
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_cards_leak",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.55,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.55)
+    assert captured["posted"] == []
+    failed = [s for s in captured["statuses"] if s[1] == "failed"]
+    assert failed
+    assert failed[-1][2] == "empty_agent_reply"
+
+
 def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():
     raw = {
         "choices": [
@@ -4417,6 +4473,49 @@ def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
 
     out = crc.call_agent_cli("hi", raw_text=True)
     assert out == cards_json
+
+
+def test_call_agent_cli_claude_raw_text_lane_returns_literal_cards_json(monkeypatch):
+    """Claude driver, capture lane: the result event's literal {"cards": [...]}
+    text must come back verbatim for the capture extractor."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude -p {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    cards_json = '{"cards": []}'
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": cards_json,
+            "session_id": "sess_capture",
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    out = crc.call_agent_cli("hi", raw_text=True)
+    assert out == cards_json
+
+
+def test_call_agent_http_simple_raw_text_returns_bare_cards_body(monkeypatch):
+    """HTTP runtime answering a capture prompt with a bare {"cards": [...]} JSON
+    body (no reply field): the raw_text lane must get the serialized JSON back."""
+
+    class _Resp:
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"cards": [{"action": "add", "summary": "s", "content": "c"}]}
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/agent")
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
+
+    out = crc._call_agent_http_simple("capture prompt", raw_text=True)
+    assert json.loads(out) == {"cards": [{"action": "add", "summary": "s", "content": "c"}]}
 
 
 # ---------------------------------------------------------------------------
