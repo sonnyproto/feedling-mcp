@@ -5,6 +5,11 @@ Feedling API-key users. It intentionally covers API-key users only. VPS/OAuth,
 iOS UI automation, and customer-incident replay remain separate follow-up
 workstreams.
 
+The dependency-light persona/memory baseline-candidate harness lives in
+[`qa/regression/README.md`](regression/README.md). Its deterministic contract
+tests run in ordinary CI; live execution remains an explicit, credentialed QA
+operation.
+
 ## What runs
 
 There are two targets:
