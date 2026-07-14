@@ -814,6 +814,18 @@ def _launch(
     cot_probe_runner: launcher.CotProbeRunner | None = None,
     live_probe_runner: launcher.LiveProbeRunner | None = None,
 ) -> dict[str, Any]:
+    def traced_runner(spec: launcher.WorkerSpec, timeout: int) -> int:
+        try:
+            return runner(spec, timeout)
+        except Exception as exc:
+            print(
+                f"fake worker {spec.profile_id} failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+
     return launcher.launch(
         codex_bin=paths["codex_bin"],
         codex_home=paths["codex_home"],
@@ -829,7 +841,7 @@ def _launch(
         base_url="https://test-api.feedling.app",
         expected_sha="a" * 40,
         timeout_seconds=600,
-        process_runner=runner,
+        process_runner=traced_runner,
         cot_probe_runner=cot_probe_runner or _cot_probe_runner(),
         live_probe_runner=live_probe_runner or _live_probe_runner,
         worker_python=paths["worker_python"],
@@ -1011,6 +1023,120 @@ def test_fake_worker_completion_is_not_coupled_to_slowest_peer(tmp_path):
 
     assert delayed is True
     assert len(receipt["workers"]) == len(PROFILE_AGENT_TYPES)
+
+
+def test_live_request_loader_retries_transient_atomic_publication(
+    tmp_path, monkeypatch
+):
+    marker = tmp_path / ".live-probe-P0-02-1.request"
+    expected = {"scenario_id": "P0-02"}
+    calls = 0
+
+    def load(_path, **_identity):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise live_request.LiveProbeRequestError(
+                "live probe request marker is unsafe"
+            )
+        return expected
+
+    monkeypatch.setattr(launcher, "load_request_marker", load)
+
+    assert launcher._load_ready_live_request(
+        marker,
+        run_id="run-123",
+        profile_id="official-deepseek",
+        scenario_id="P0-02",
+        attempt=1,
+    ) == expected
+    assert calls == 2
+
+
+def test_cot_request_loader_retries_transient_shell_publication(monkeypatch):
+    spec = object()
+    calls = 0
+
+    def validate(received):
+        nonlocal calls
+        assert received is spec
+        calls += 1
+        if calls == 1:
+            raise launcher.WorkerLaunchError("COT probe request marker is invalid")
+
+    monkeypatch.setattr(launcher, "_validate_cot_request", validate)
+
+    launcher._validate_ready_cot_request(spec)
+    assert calls == 2
+
+
+def test_transient_request_publication_invokes_each_trusted_probe_once(
+    tmp_path, monkeypatch
+):
+    paths = _setup(tmp_path)
+    original = launcher.load_request_marker
+    first_reads: set[Path] = set()
+    invocations: dict[tuple[str, str, int], int] = {}
+
+    def transient_load(path, **identity):
+        if path not in first_reads:
+            first_reads.add(path)
+            raise live_request.LiveProbeRequestError(
+                "live probe request marker is unsafe"
+            )
+        return original(path, **identity)
+
+    def counting_probe(spec, scenario_id, attempt, nonce):
+        key = (spec.profile_id, scenario_id, attempt)
+        invocations[key] = invocations.get(key, 0) + 1
+        return _live_probe_runner(spec, scenario_id, attempt, nonce)
+
+    monkeypatch.setattr(launcher, "load_request_marker", transient_load)
+    receipt = _launch(
+        paths,
+        _successful_runner([]),
+        live_probe_runner=counting_probe,
+    )
+
+    assert len(receipt["workers"]) == len(PROFILE_AGENT_TYPES)
+    assert len(first_reads) == len(PROFILE_AGENT_TYPES) * len(
+        live_request.LIVE_SCENARIO_IDS
+    )
+    assert len(invocations) == len(first_reads)
+    assert set(invocations.values()) == {1}
+
+
+def test_transient_cot_publication_invokes_each_trusted_probe_once(
+    tmp_path, monkeypatch
+):
+    paths = _setup(tmp_path)
+    original_validate = launcher._validate_cot_request
+    passing_probe = _cot_probe_runner()
+    first_reads: set[str] = set()
+    invocations: dict[str, int] = {}
+
+    def transient_validate(spec):
+        if spec.profile_id not in first_reads:
+            first_reads.add(spec.profile_id)
+            raise launcher.WorkerLaunchError("COT probe request marker is invalid")
+        original_validate(spec)
+
+    def counting_probe(spec):
+        invocations[spec.profile_id] = invocations.get(spec.profile_id, 0) + 1
+        return passing_probe(spec)
+
+    monkeypatch.setattr(launcher, "_validate_cot_request", transient_validate)
+    receipt = _launch(
+        paths,
+        _successful_runner([]),
+        cot_probe_runner=counting_probe,
+    )
+
+    expected_profiles = {profile_id for profile_id, _ in PROFILE_AGENT_TYPES}
+    assert len(receipt["workers"]) == len(PROFILE_AGENT_TYPES)
+    assert first_reads == expected_profiles
+    assert set(invocations) == expected_profiles
+    assert set(invocations.values()) == {1}
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -31,6 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 from jsonschema import Draft202012Validator
 
 try:
+    from qa.atomic_private_file import AtomicPrivateFileError, create_private_file
     from qa.codex_output_schema import validate_authoring_schema
     from qa.diagnostic_results import DiagnosticResultError, agent_error_profile
     from qa.orchestration_contract import PROFILE_AGENT_TYPES
@@ -72,6 +74,7 @@ try:
     )
     from qa.write_codex_config import worker_permission_profile
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
+    from atomic_private_file import AtomicPrivateFileError, create_private_file
     from codex_output_schema import validate_authoring_schema
     from diagnostic_results import DiagnosticResultError, agent_error_profile
     from orchestration_contract import PROFILE_AGENT_TYPES
@@ -124,6 +127,7 @@ _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_EVENTS_BYTES = 64 * 1024 * 1024
+_REQUEST_PUBLICATION_GRACE_SECONDS = 2.0
 _AMBIENT_READ_ROOTS = tuple(
     dict.fromkeys(Path(value).resolve() for value in ("/tmp", "/var/tmp", "/dev/shm"))
 )
@@ -415,16 +419,9 @@ def verify_codex_version(codex_bin: Path) -> None:
 
 
 def _create_private_file(path: Path, content: bytes = b"") -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
+        create_private_file(path, content)
+    except AtomicPrivateFileError:
         raise WorkerLaunchError("unable to create private worker evidence") from None
 
 
@@ -639,6 +636,32 @@ def _write_live_error_facts(
     )
 
 
+def _load_ready_live_request(
+    path: Path,
+    *,
+    run_id: str,
+    profile_id: str,
+    scenario_id: str,
+    attempt: int,
+) -> Mapping[str, Any]:
+    """Allow atomic hard-link publication to settle to one private link."""
+
+    deadline = time.monotonic() + _REQUEST_PUBLICATION_GRACE_SECONDS
+    while True:
+        try:
+            return load_request_marker(
+                path,
+                run_id=run_id,
+                profile_id=profile_id,
+                scenario_id=scenario_id,
+                attempt=attempt,
+            )
+        except LiveProbeRequestError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def _perform_trusted_live_handshake(
     spec: WorkerSpec,
     scenario_id: str,
@@ -648,7 +671,7 @@ def _perform_trusted_live_handshake(
 ) -> None:
     request_path, facts_path = _live_handshake_paths(spec, scenario_id, attempt)
     try:
-        load_request_marker(
+        _load_ready_live_request(
             request_path,
             run_id=str(spec.environment["QA_RUN_ID"]),
             profile_id=spec.profile_id,
@@ -736,6 +759,20 @@ def _validate_cot_request(spec: WorkerSpec) -> None:
         raise WorkerLaunchError("COT probe request marker is invalid")
 
 
+def _validate_ready_cot_request(spec: WorkerSpec) -> None:
+    """Retry only marker validation while shell redirection finishes writing."""
+
+    deadline = time.monotonic() + _REQUEST_PUBLICATION_GRACE_SECONDS
+    while True:
+        try:
+            _validate_cot_request(spec)
+            return
+        except WorkerLaunchError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def _write_cot_error_facts(spec: WorkerSpec) -> None:
     """Unblock the agent without fabricating an authoritative receipt."""
 
@@ -757,7 +794,7 @@ def _perform_trusted_cot_handshake(
     """Consume the agent's marker and publish only validated sanitized facts."""
 
     try:
-        _validate_cot_request(spec)
+        _validate_ready_cot_request(spec)
         if spec.cot_receipt_path.exists() or spec.cot_facts_path.exists():
             raise WorkerLaunchError("trusted COT probe paths are not pristine")
         returned = cot_probe_runner(spec)

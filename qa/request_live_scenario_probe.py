@@ -20,6 +20,11 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+try:
+    from qa.atomic_private_file import AtomicPrivateFileError, create_private_file
+except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
+    from atomic_private_file import AtomicPrivateFileError, create_private_file
+
 
 LIVE_SCENARIO_IDS = (
     "P0-02",
@@ -173,16 +178,9 @@ def write_request_marker(
         )
         + "\n"
     ).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
+        create_private_file(path, payload)
+    except AtomicPrivateFileError:
         raise LiveProbeRequestError("unable to create live probe request") from None
 
 
