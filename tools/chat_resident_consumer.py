@@ -8189,6 +8189,25 @@ def _resident_existing_identity() -> dict:
         return {}
 
 
+def _resident_current_replaced_at() -> str:
+    """Best-effort read of the current identity's outer ``replaced_at`` (P5 concurrency
+    baseline, Task 3) — used to refresh the retry baseline after an identity_base_stale
+    conflict (Task 5). Same enclave-first / cloud-fallback shape as
+    ``_resident_existing_identity``; "" on any failure or missing field (never raises,
+    never invents a value)."""
+    try:
+        body = (
+            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+            if FEEDLING_ENCLAVE_URL else {}
+        )
+        if not isinstance(body.get("identity"), dict):
+            body = _capture_get_json("/v1/identity/get")
+        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        return str(identity.get("replaced_at") or "")
+    except Exception:
+        return ""
+
+
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
@@ -8233,15 +8252,48 @@ def _process_resident_distill_once() -> None:
             identity_status = "skipped"
             if mode == "update_identity":
                 identity_payload = _resident_derive_identity(document, job_id)
-                if identity_payload:
-                    execute_identity_actions([{
-                        "type": "identity.replace",
-                        "source": "genesis_resident_distill",
-                        "job_id": job_id,
-                        "reason": "Distilled identity from material the user uploaded.",
-                        "identity": identity_payload,
-                    }])
-                    identity_status = "replaced"
+                # base_identity_replaced_at (Task 4) is the P5 concurrency baseline snapshotted
+                # at job-creation time; "" means no baseline (legacy job / no prior identity) —
+                # the backend then skips the check entirely (back-compat). Only a full
+                # init/replace moves replaced_at, so a signature patch/nudge landing while this
+                # job was pending never looks like a conflict here.
+                base_identity_replaced_at = str(job.get("base_identity_replaced_at") or "")
+                conflict_retried = False
+                while identity_payload is not None:
+                    try:
+                        execute_identity_actions([{
+                            "type": "identity.replace",
+                            "source": "genesis_resident_distill",
+                            "job_id": job_id,
+                            "reason": "Distilled identity from material the user uploaded.",
+                            "identity": identity_payload,
+                            "base_identity_replaced_at": base_identity_replaced_at,
+                        }])
+                        identity_status = "replaced"
+                        break
+                    except RuntimeError as e:
+                        if "identity_base_stale" not in str(e):
+                            raise
+                        if conflict_retried:
+                            log.error(
+                                "resident distill: identity_base_stale conflict persisted "
+                                "after re-derive job=%s — giving up, skipping identity update",
+                                job_id,
+                            )
+                            identity_status = "skipped_conflict"
+                            break
+                        log.warning(
+                            "resident distill: identity_base_stale conflict job=%s — "
+                            "re-fetching card + re-deriving once",
+                            job_id,
+                        )
+                        conflict_retried = True
+                        # _resident_derive_identity re-fetches the existing card internally
+                        # (_resident_existing_identity), so this re-call already merges against
+                        # whatever full replace won the race — then resubmit with a refreshed
+                        # baseline so the retry itself can't spuriously re-conflict.
+                        identity_payload = _resident_derive_identity(document, job_id)
+                        base_identity_replaced_at = _resident_current_replaced_at()
             else:  # add_memory / onboarding → cloud memory engine
                 # long-term-memory archive → keep_all (thorough); chat log → selective.
                 keep_all = material_kind == "memory_summary"

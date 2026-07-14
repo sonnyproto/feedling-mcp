@@ -125,3 +125,126 @@ def test_memory_snapshot_error_returns_empty(monkeypatch):
     monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
     terms, known = crc._resident_memory_snapshot()
     assert terms == "" and known == []
+
+
+# --------------------------------------------------------------------------- #
+# P5 (Task 5): update_identity path — base_identity_replaced_at forwarding +
+# conflict-aware re-derive on identity_base_stale.
+# --------------------------------------------------------------------------- #
+
+def _resident_job(job_id="job1", base_identity_replaced_at="2026-07-01T00:00:00"):
+    return {
+        "job_id": job_id,
+        "mode": "update_identity",
+        "material_kind": "",
+        "base_identity_replaced_at": base_identity_replaced_at,
+        "sealed": {"envelope": {"body_ct": "x"}},
+    }
+
+
+def _patch_distill_pipeline(monkeypatch, job, derive_results, execute_side_effects,
+                             refreshed_baseline="2026-07-02T00:00:00"):
+    monkeypatch.setattr(crc, "genesis_resident_pending", lambda: [job])
+    monkeypatch.setattr(crc, "genesis_resident_heartbeat", lambda job_id: None)
+    monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"persona document")
+    monkeypatch.setattr(crc, "_resident_current_replaced_at", lambda: refreshed_baseline)
+
+    completed: dict = {}
+
+    def fake_complete(job_id, *, memory_action_count, identity_status):
+        completed["job_id"] = job_id
+        completed["memory_action_count"] = memory_action_count
+        completed["identity_status"] = identity_status
+
+    monkeypatch.setattr(crc, "genesis_resident_complete", fake_complete)
+
+    derive_calls = {"n": 0}
+
+    def fake_derive(document, job_id):
+        derive_calls["n"] += 1
+        idx = min(derive_calls["n"] - 1, len(derive_results) - 1)
+        return derive_results[idx]
+
+    monkeypatch.setattr(crc, "_resident_derive_identity", fake_derive)
+
+    execute_calls = {"n": 0, "baselines": []}
+
+    def fake_execute(actions):
+        execute_calls["n"] += 1
+        execute_calls["baselines"].append(actions[0].get("base_identity_replaced_at"))
+        idx = execute_calls["n"] - 1
+        effect = execute_side_effects[min(idx, len(execute_side_effects) - 1)]
+        if isinstance(effect, Exception):
+            raise effect
+        return effect
+
+    monkeypatch.setattr(crc, "execute_identity_actions", fake_execute)
+    return completed, derive_calls, execute_calls
+
+
+def test_update_identity_forwards_job_baseline_on_first_attempt(monkeypatch):
+    job = _resident_job()
+    completed, derive_calls, execute_calls = _patch_distill_pipeline(
+        monkeypatch, job,
+        derive_results=[{"agent_name": "A"}],
+        execute_side_effects=[{"status": "ok"}],
+    )
+    crc._process_resident_distill_once()
+    assert derive_calls["n"] == 1
+    assert execute_calls["n"] == 1
+    assert execute_calls["baselines"] == ["2026-07-01T00:00:00"]
+    assert completed["identity_status"] == "replaced"
+
+
+def test_update_identity_conflict_once_then_succeeds(monkeypatch):
+    job = _resident_job()
+    completed, derive_calls, execute_calls = _patch_distill_pipeline(
+        monkeypatch, job,
+        derive_results=[{"agent_name": "A"}, {"agent_name": "B"}],
+        execute_side_effects=[
+            RuntimeError('identity_actions_http_409:{"error": "identity_base_stale"}'),
+            {"status": "ok"},
+        ],
+    )
+    crc._process_resident_distill_once()
+    # derive ran twice (initial + one re-derive after the conflict).
+    assert derive_calls["n"] == 2
+    # execute ran twice; the retry carried the REFRESHED baseline, not the stale job one.
+    assert execute_calls["n"] == 2
+    assert execute_calls["baselines"] == ["2026-07-01T00:00:00", "2026-07-02T00:00:00"]
+    assert completed["identity_status"] == "replaced"
+
+
+def test_update_identity_conflict_twice_gives_up_no_third_attempt(monkeypatch):
+    job = _resident_job()
+    completed, derive_calls, execute_calls = _patch_distill_pipeline(
+        monkeypatch, job,
+        derive_results=[{"agent_name": "A"}, {"agent_name": "B"}],
+        execute_side_effects=[
+            RuntimeError('identity_actions_http_409:{"error": "identity_base_stale"}'),
+            RuntimeError('identity_actions_http_409:{"error": "identity_base_stale"}'),
+        ],
+    )
+    crc._process_resident_distill_once()
+    # Exactly one re-derive, exactly one retry — never a third attempt (no infinite loop).
+    assert derive_calls["n"] == 2
+    assert execute_calls["n"] == 2
+    assert completed["identity_status"] == "skipped_conflict"
+    # job still completes (not left hanging for the reaper) despite the conflict.
+    assert completed["job_id"] == "job1"
+
+
+def test_update_identity_non_conflict_error_propagates_and_job_not_completed(monkeypatch):
+    # A non-identity_base_stale error must NOT be swallowed as a conflict — it should
+    # propagate up to the outer per-job try/except (leaving the job for the stale reaper),
+    # same as before this change.
+    job = _resident_job()
+    completed, derive_calls, execute_calls = _patch_distill_pipeline(
+        monkeypatch, job,
+        derive_results=[{"agent_name": "A"}],
+        execute_side_effects=[RuntimeError("identity_actions_http_500:boom")],
+    )
+    crc._process_resident_distill_once()  # swallowed by the outer except + logged, not raised
+    assert derive_calls["n"] == 1
+    assert execute_calls["n"] == 1
+    assert completed == {}  # genesis_resident_complete never called
