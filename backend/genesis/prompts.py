@@ -201,6 +201,25 @@ FACT_WRITE_KEEP_ALL_SUFFIX = """
 ★ 素材是用户整理好的长期档案:把候选里的事实【尽量都写成卡】,不要为了"少而精"丢弃条目。
 仍然按 known_memories 去重、仍然归好 bucket/threads,但不要因"不够重要"而跳过用户特意整理的条目。"""
 
+MEMORY_RECHECK_PROMPT = """你在做 VPS resident 记忆蒸馏的【收口二次检查】。
+输入包含:
+- original_material: 原始上传素材/聊天记录;
+- written_memories: 上一轮 fact_write 刚写出的记忆;
+- known_memories: 之前已经保存过、或本轮已经写过的记忆摘要。
+
+任务:只检查有没有【真实、有价值、持久】的 memory 被上一轮漏掉。只补遗漏;没有遗漏就返回空数组。
+
+硬规则:
+- 只写 original_material 直接支持的事实/事件/原话/时刻;绝不编造、绝不推断、绝不为了凑数量补卡。
+- written_memories 和 known_memories 里已有的事实不要再写一遍;同一件事换说法、合并/拆分措辞都算重复。
+- 闲聊、临时情绪、玩笑、未确认猜测、一次性无长期价值的内容不补。
+- 输出只允许 memory 卡;不要输出 identity/persona/days_with_user/relationship_anchor_evidence。
+- bucket/threads/summary/content 用素材原文语言;中文素材用中文桶名和线索。
+
+输出 JSON:
+{"memories":[{"type":"fact|event|quote|moment","bucket":"...","threads":["..."],"summary":"...","content":"...","importance":0.5,"pulse":0.3}]}
+没有真实遗漏就 {"memories":[]}。"""
+
 
 def fact_map_messages(chunk_text: str, *, keep_all: bool = False) -> list[dict[str, str]]:
     system = FACT_MAP_PROMPT + (FACT_MAP_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
@@ -217,8 +236,36 @@ def combined_map_messages(chunk_text: str) -> list[dict[str, str]]:
     ]
 
 
-def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False) -> list[dict[str, str]]:
-    system = FACT_WRITE_PROMPT + (FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
+def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False, floor_note: str = "", terms_note: str = "") -> list[dict[str, str]]:
+    keep_all_suffix = FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else ""
+    terms_note_text = (("\n\n★ " + str(terms_note).strip()) if str(terms_note or "").strip() else "")
+    floor_note_text = (("\n\n★ " + str(floor_note).strip()) if str(floor_note or "").strip() else "")
+    insert_text = terms_note_text + floor_note_text
+
+    if insert_text:
+        # Insert terms_note (existing buckets/threads snapshot) then floor_note before the
+        # firewall section, but anchor keep_all_suffix at the end.
+        firewall_idx = FACT_WRITE_PROMPT.find("\n防火墙:")
+        if firewall_idx > 0:
+            system = (
+                FACT_WRITE_PROMPT[:firewall_idx]
+                + insert_text
+                + FACT_WRITE_PROMPT[firewall_idx:]
+                + keep_all_suffix
+                + _STRICT_JSON_SUFFIX
+            )
+        else:
+            # Fallback if marker not found
+            system = (
+                FACT_WRITE_PROMPT
+                + insert_text
+                + keep_all_suffix
+                + _STRICT_JSON_SUFFIX
+            )
+    else:
+        # Default behavior: no changes to output
+        system = FACT_WRITE_PROMPT + keep_all_suffix + _STRICT_JSON_SUFFIX
+
     return [
         {"role": "system", "content": system},
         {
@@ -228,6 +275,28 @@ def fact_write_messages(fact_digest: list[dict], persona_material: str = "", mem
                 "persona_material": persona_material or "",
                 "memory_summary": memory_summary or "",
                 "known_memories": [str(m) for m in (known_memories or []) if str(m or "").strip()],
+            }),
+        },
+    ]
+
+
+def memory_recheck_messages(
+    original_material: str,
+    written_memories: list[dict],
+    known_memories: list[str] | None = None,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": MEMORY_RECHECK_PROMPT + _STRICT_JSON_SUFFIX},
+        {
+            "role": "user",
+            "content": _json({
+                "original_material": str(original_material or ""),
+                "written_memories": [
+                    item for item in (written_memories or []) if isinstance(item, dict)
+                ],
+                "known_memories": [
+                    str(m) for m in (known_memories or []) if str(m or "").strip()
+                ],
             }),
         },
     ]

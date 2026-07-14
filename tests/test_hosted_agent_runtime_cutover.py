@@ -29,18 +29,18 @@ def test_driver_map_pi():
     assert c.driver_for_provider("openai_compatible") == "pi"
     assert c.driver_for_provider("gemini") == "pi"
     assert c.driver_for_provider("openrouter") == "pi"
-    assert c.driver_for_provider("deepseek") == "pi"
+    assert c.driver_for_provider("deepseek") == "claude"
     assert c.driver_for_provider("anthropic") == "claude"
     assert c.driver_for_provider("openai") == "codex"
 
 
 def test_driver_for_provider_is_derived_not_chosen():
-    # Claude Code (Anthropic-wire) handles ONLY anthropic; Codex is
-    # openai-native only; pi is the catch-all for the rest (incl. deepseek),
-    # unconditionally.
+    # Claude Code (Anthropic-wire) handles anthropic AND deepseek (its
+    # /anthropic-compatible endpoint); Codex is openai-native only; pi is the
+    # catch-all for the openai-completions relays, unconditionally.
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("claude") == "claude"      # alias → anthropic
-    assert cutover.driver_for_provider("deepseek") == "pi"        # direct relay, no gateway
+    assert cutover.driver_for_provider("deepseek") == "claude"    # Anthropic-wire /anthropic compat
     assert cutover.driver_for_provider("openai") == "codex"
     # gemini/openrouter/openai_compatible → pi, unconditionally (no gateway hop)
     for p in ("gemini", "openrouter", "openai_compatible"):
@@ -50,8 +50,8 @@ def test_driver_for_provider_is_derived_not_chosen():
         assert cutover.driver_for_provider(p) == "legacy"
 
 
-def test_deepseek_derives_to_pi_anthropic_stays_claude():
-    assert cutover.driver_for_provider("deepseek") == "pi"
+def test_deepseek_derives_to_claude_like_anthropic():
+    assert cutover.driver_for_provider("deepseek") == "claude"
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("openai") == "codex"
 
@@ -72,7 +72,7 @@ def test_gemini_and_openrouter_derive_to_pi_unconditionally():
     assert cutover.driver_for_provider("openai_compatible") == "pi"
     assert cutover.driver_for_provider("openai") == "codex"
     assert cutover.driver_for_provider("anthropic") == "claude"
-    assert cutover.driver_for_provider("deepseek") == "pi"
+    assert cutover.driver_for_provider("deepseek") == "claude"
 
 
 def test_codex_transport_only_native_or_empty():
@@ -94,7 +94,7 @@ def test_resolve_driver_raises_when_no_provider():
 def test_resolve_driver_derives_agent_from_provider():
     # Provider alone determines the driver — no per-user flag needed
     assert cutover.resolve_driver({"provider": "anthropic"}) == "claude"
-    assert cutover.resolve_driver({"provider": "deepseek"}) == "pi"
+    assert cutover.resolve_driver({"provider": "deepseek"}) == "claude"
     assert cutover.resolve_driver({"provider": "openai"}) == "codex"
 
 
@@ -419,12 +419,12 @@ def test_check_supervisor_live_instance_read_error_falls_back_to_legacy(monkeypa
 # ---- pi driver derivation (unconditional) ----
 
 def test_driver_for_provider_pi_is_unconditional():
-    # No flag gates pi: openai_compatible/gemini/openrouter/deepseek always → pi.
+    # No flag gates pi: openai_compatible/gemini/openrouter always → pi.
     assert cutover.driver_for_provider("openai_compatible") == "pi"
     assert cutover.driver_for_provider("gemini") == "pi"
     assert cutover.driver_for_provider("openrouter") == "pi"
     assert cutover.driver_for_provider("anthropic") == "claude"
-    assert cutover.driver_for_provider("deepseek") == "pi"
+    assert cutover.driver_for_provider("deepseek") == "claude"
     assert cutover.driver_for_provider("openai") == "codex"
 
 

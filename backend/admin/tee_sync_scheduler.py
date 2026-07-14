@@ -26,6 +26,7 @@ import os
 import threading
 import time
 
+import db
 from tee_shadow import mirror
 
 log = logging.getLogger("feedling.tee_sync")
@@ -80,6 +81,19 @@ def _interval() -> float:
         return 300.0
 
 
+# per-table 整表失败退避。没有它，一张慢性失败的表（2026-07-14 prod 实测：text-cursor
+# 分隔符 NUL 让 memory_moments/world_book_entries 每 tick 必败）会被每 tick 无退避地
+# 全量重跑——重拉 + 重解密（enclave HTTP）同一段卡住的行，把名义 300s 的 tick 拖成
+# 13-87 分钟连轴转，成为 backend 内存/CPU churn 的主源之一。连败按 2^n 指数退避、
+# 封顶 _BACKOFF_CAP_SEC；成功一次即清零。仅内存态：worker 重启 = 立即重试，正确。
+_BACKOFF_CAP_SEC = 3600.0
+_table_backoff: dict[str, tuple[int, float]] = {}  # table -> (连败次数, monotonic 重试时点)
+
+
+def _backoff_delay(fails: int) -> float:
+    return min(_interval() * (2 ** max(0, fails - 1)), _BACKOFF_CAP_SEC)
+
+
 def _reconcile_interval() -> float:
     try:
         return max(300.0, float(os.environ.get("FEEDLING_TEE_RECONCILE_INTERVAL_SEC", "86400") or 86400))
@@ -132,8 +146,15 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
 
     # (2) replicate 密文子表在后 —— 父表已在，不再 FK 失败。
     for table in _CIPHERTEXT_TABLES:
+        fails, retry_at = _table_backoff.get(table, (0, 0.0))
+        if retry_at > time.monotonic():
+            # 连败退避中 → 本 tick 跳过这张表（其余表照常），到点自动恢复重试。
+            summary["report"].setdefault("replicate_backoff", []).append(table)
+            log.info("[tee-sync] replicate %s 退避中(连败%d) — 跳过本 tick", table, fails)
+            continue
         try:
             rep = tr.run_action(action="replicate", table=table, dry_run=False, confirm="MIGRATE")
+            _table_backoff.pop(table, None)  # 整表成功 → 退避清零
             summary["replicate_copied"] += rep.get("copied") or 0
             summary["replicate_pending"] += rep.get("pending") or 0
             summary["replicate_errors"] += rep.get("errors") or 0
@@ -156,7 +177,10 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             # report 和 replicate_errors(只统计成功 run 的逐行错)里双双消失。
             summary["replicate_table_failures"] += 1
             summary["report"].setdefault("replicate_failed", {})[table] = str(e)[:200]
-            log.warning("[tee-sync] replicate %s 失败: %s", table, e)
+            fails += 1
+            _table_backoff[table] = (fails, time.monotonic() + _backoff_delay(fails))
+            log.warning("[tee-sync] replicate %s 失败(连败%d, 退避%.0fs): %s",
+                        table, fails, _backoff_delay(fails), e)
 
     # (3) verify 对账 —— reconcile 成功才有意义;这是收敛度的量测来源。
     if do_reconcile and reconcile_ok:
@@ -188,7 +212,6 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
     summary["duration_ms"] = round((time.monotonic() - t0) * 1000, 1)
     summary["report"]["health"] = health
     try:
-        import db
         db.record_tee_sync_run(summary)
     except Exception as e:  # noqa: BLE001 — 落库失败不影响同步/循环
         log.warning("[tee-sync] 指标落库失败: %s", e)
@@ -208,9 +231,29 @@ def _should_reconcile(last_reconcile: float | None, now: float) -> bool:
     return last_reconcile is None or (now - last_reconcile) >= _reconcile_interval()
 
 
+def _restore_last_reconcile() -> float | None:
+    """从 tee_sync_runs 恢复「上次成功 reconcile」的时点（换算到本进程 monotonic 轴）。
+
+    last_reconcile 不能只活在内存里：gunicorn max_requests 回收 leader worker 后，
+    新 leader 若从 None 起步就重做 reconcile-first——完整 reconcile 要数十分钟，
+    worker 寿命一短它就永远跑不完（2026-07-14 test 实测：部署后 2h leader 反复换手、
+    tee_sync_runs 零新行）。从 DB 恢复后，只有真到 reconcile 间隔才重跑；真正的
+    首次基线（库里没有任何成功 reconcile）仍然 reconcile-first。DB 读失败兜底回
+    None = 现状语义。"""
+    try:
+        age = db.last_tee_reconcile_age_sec()
+        if age is None:
+            return None
+        return time.monotonic() - age
+    except Exception as e:  # noqa: BLE001 — 恢复失败不阻断循环
+        log.warning("[tee-sync] last_reconcile 恢复失败(退回 reconcile-first): %s", e)
+        return None
+
+
 def _loop() -> None:
-    # last_reconcile=None → 首个成功 tick 必 reconcile 建立基线（见 _should_reconcile）。
-    last_reconcile: float | None = None
+    # 先从 DB 恢复上次成功 reconcile 时点（见 _restore_last_reconcile）；库里从没
+    # 成功过 → None → 首个成功 tick 必 reconcile 建立基线（见 _should_reconcile）。
+    last_reconcile: float | None = _restore_last_reconcile()
     first = True
     while True:
         # 首个 tick 只等一小会儿就跑 —— 尽快把明文父表回填上，缩短「父表未回填 →

@@ -31,7 +31,9 @@ import json
 import logging
 import os
 import threading
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -575,6 +577,24 @@ def record_tee_sync_run(summary: dict) -> None:
         log.error("[db] record_tee_sync_run failed: %s", e)
 
 
+def last_tee_reconcile_age_sec() -> float | None:
+    """Seconds since the most recent SUCCESSFUL reconcile tick, or None if there
+    has never been one. Read by the tee-sync scheduler at loop start so a new
+    leader (gunicorn worker recycling hands leadership over) does not restart
+    from ``last_reconcile=None`` and redo reconcile-first — a full reconcile
+    takes tens of minutes, so with short worker lifetimes it would never finish
+    (2026-07-14 test: 2h of leader churn, zero completed ticks). Age is computed
+    server-side (``now() - max(ran_at)``) so client clock skew is irrelevant."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT EXTRACT(EPOCH FROM (now() - max(ran_at))) FROM tee_sync_runs "
+            "WHERE did_reconcile AND reconcile_ok IS TRUE"
+        ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
+
+
 def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     """Most-recent TEE sync summaries, newest first (observability endpoint).
     ``ran_at`` is ISO-8601; ``report`` is the parsed JSONB detail dict."""
@@ -940,8 +960,32 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def _dau_row(row) -> dict:
+    return {
+        "day": row[0],
+        "dau": int(row[1] or 0),
+        "chat_dau": int(row[2] or 0),
+        "tracking_dau": int(row[3] or 0),
+        "active_events": int(row[4] or 0),
+        "user_messages": int(row[5] or 0),
+        "tracking_events": int(row[6] or 0),
+        "first_ts": row[7],
+        "last_ts": row[8],
+        "avg_session_sec": float(row[9] or 0),
+        "foreground_sec": int(row[10] or 0),
+        "session_count": int(row[11] or 0),
+        "session_dau": int(row[12] or 0),
+        "frozen": bool(row[13]),
+    }
+
+
 def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
-    """Return metadata-only daily active user aggregates.
+    """Return daily active-user aggregates, preferring immutable snapshots.
+
+    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
+    before the snapshot boundary remain live. If ``since_epoch`` cuts through
+    a frozen day, that day also falls back to live data so the existing exact
+    timestamp-filter contract is preserved. Every row exposes ``frozen``.
 
     DAU is intentionally user-initiated activity only: user chat messages plus
     client tracking events. Agent replies, proactive writes, and synthetic
@@ -1006,41 +1050,194 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                         COUNT(DISTINCT user_id)::int AS session_dau
                     FROM usage_events
                     GROUP BY day
+                ),
+                live AS (
+                    SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
+                           d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
+                           COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
+                           COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                           COALESCE(u.session_count, 0)::int AS session_count,
+                           COALESCE(u.session_dau, 0)::int AS session_dau
+                    FROM daily d
+                    LEFT JOIN usage_daily u ON u.day = d.day
+                ),
+                frozen_rows AS (
+                    SELECT day, dau, chat_dau, tracking_dau, active_events,
+                           user_messages, tracking_events, first_ts, last_ts,
+                           avg_session_sec, foreground_sec, session_count, session_dau
+                    FROM dau_daily_snapshot
+                    WHERE active_events > 0
+                      AND (%s = 0 OR first_ts >= %s)
+                ),
+                merged AS (
+                    SELECT f.*, TRUE AS frozen FROM frozen_rows f
+                    UNION ALL
+                    SELECT l.*, FALSE AS frozen
+                    FROM live l
+                    WHERE NOT EXISTS (SELECT 1 FROM frozen_rows f WHERE f.day = l.day)
                 )
-                SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
-                       d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
-                       COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
-                       COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
-                       COALESCE(u.session_count, 0)::int AS session_count,
-                       COALESCE(u.session_dau, 0)::int AS session_dau
-                FROM daily d
-                LEFT JOIN usage_daily u ON u.day = d.day
-                ORDER BY d.day DESC
+                SELECT day, dau, chat_dau, tracking_dau, active_events,
+                       user_messages, tracking_events, first_ts, last_ts,
+                       avg_session_sec, foreground_sec, session_count, session_dau,
+                       frozen
+                FROM merged
+                ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, day_limit),
+                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
             ).fetchall()
-        return [
-            {
-                "day": row[0],
-                "dau": row[1],
-                "chat_dau": row[2],
-                "tracking_dau": row[3],
-                "active_events": row[4],
-                "user_messages": row[5],
-                "tracking_events": row[6],
-                "first_ts": row[7],
-                "last_ts": row[8],
-                "avg_session_sec": float(row[9] or 0),
-                "foreground_sec": int(row[10] or 0),
-                "session_count": int(row[11] or 0),
-                "session_dau": int(row[12] or 0),
-            }
-            for row in rows
-        ]
+        return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
         return []
+
+
+def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
+    zone = ZoneInfo(tz)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    row = conn.execute(
+        """
+        WITH active AS (
+            SELECT user_id, ts, 'chat' AS source
+            FROM chat_messages
+            WHERE doc->>'role' = 'user'
+              AND COALESCE(doc->>'source', '') <> 'verify_ping'
+              AND ts >= %s AND ts < %s
+
+            UNION ALL
+
+            SELECT user_id, ts, 'tracking' AS source
+            FROM user_logs
+            WHERE stream = 'tracking_events'
+              AND ts IS NOT NULL
+              AND ts >= %s AND ts < %s
+        ),
+        usage_events AS (
+            SELECT
+                user_id,
+                CASE
+                  WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                  THEN (doc->'payload'->>'duration_sec')::bigint
+                  ELSE 0
+                END AS duration_sec
+            FROM user_logs
+            WHERE stream = 'tracking_events'
+              AND doc->>'type' = 'app_session_end'
+              AND ts IS NOT NULL
+              AND ts >= %s AND ts < %s
+        )
+        SELECT
+            COUNT(DISTINCT user_id)::int AS dau,
+            (COUNT(DISTINCT user_id) FILTER (WHERE source = 'chat'))::int AS chat_dau,
+            (COUNT(DISTINCT user_id) FILTER (WHERE source = 'tracking'))::int AS tracking_dau,
+            COUNT(*)::int AS active_events,
+            (COUNT(*) FILTER (WHERE source = 'chat'))::int AS user_messages,
+            (COUNT(*) FILTER (WHERE source = 'tracking'))::int AS tracking_events,
+            MIN(ts) AS first_ts,
+            MAX(ts) AS last_ts,
+            COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
+            COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
+            (SELECT COUNT(*)::int FROM usage_events),
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+        FROM active
+        """,
+        (start, end, start, end, start, end),
+    ).fetchone()
+    return {
+        "day": day.isoformat(),
+        "dau": int(row[0] or 0),
+        "chat_dau": int(row[1] or 0),
+        "tracking_dau": int(row[2] or 0),
+        "active_events": int(row[3] or 0),
+        "user_messages": int(row[4] or 0),
+        "tracking_events": int(row[5] or 0),
+        "first_ts": row[6],
+        "last_ts": row[7],
+        "avg_session_sec": float(row[8] or 0),
+        "foreground_sec": int(row[9] or 0),
+        "session_count": int(row[10] or 0),
+        "session_dau": int(row[11] or 0),
+    }
+
+
+def freeze_completed_dau_days(*, now_epoch: float | None = None,
+                              tz: str = "Asia/Shanghai") -> list[str]:
+    """Insert immutable snapshots for completed Beijing days.
+
+    The first successful run freezes yesterday only, establishing the rollout
+    boundary without pretending older, already-understated history is exact.
+    Later runs fill every missing day from that boundary through yesterday.
+    Zero-activity rows are stored to preserve the boundary but omitted from the
+    DAU read API. ``ON CONFLICT DO NOTHING`` makes concurrent ticks write-once.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        last_completed = now.date() - timedelta(days=1)
+        with get_pool().connection() as conn:
+            row = conn.execute("SELECT MIN(day) FROM dau_daily_snapshot").fetchone()
+            first_day = date.fromisoformat(row[0]) if row and row[0] else last_completed
+            if first_day > last_completed:
+                return []
+            existing = {
+                date.fromisoformat(r[0])
+                for r in conn.execute(
+                    "SELECT day FROM dau_daily_snapshot WHERE day >= %s AND day <= %s",
+                    (first_day.isoformat(), last_completed.isoformat()),
+                ).fetchall()
+            }
+            inserted: list[str] = []
+            cursor = first_day
+            while cursor <= last_completed:
+                if cursor not in existing:
+                    snap = _completed_dau_row(conn, day=cursor, tz=tz)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO dau_daily_snapshot (
+                            day, dau, chat_dau, tracking_dau, active_events,
+                            user_messages, tracking_events, session_dau,
+                            avg_session_sec, foreground_sec, session_count,
+                            first_ts, last_ts
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (day) DO NOTHING
+                        RETURNING day
+                        """,
+                        (
+                            snap["day"], snap["dau"], snap["chat_dau"],
+                            snap["tracking_dau"], snap["active_events"],
+                            snap["user_messages"], snap["tracking_events"],
+                            snap["session_dau"], snap["avg_session_sec"],
+                            snap["foreground_sec"], snap["session_count"],
+                            snap["first_ts"], snap["last_ts"],
+                        ),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(saved[0])
+                cursor += timedelta(days=1)
+        return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_dau_days failed: %s", e)
+        return []
+
+
+def admin_dau_snapshot_bounds() -> dict:
+    """Return the immutable snapshot range for admin rendering."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM dau_daily_snapshot"
+            ).fetchone()
+        return {
+            "first_day": row[0] or "",
+            "last_day": row[1] or "",
+            "days": int(row[2] or 0),
+        }
+    except Exception as e:
+        log.error("[db] admin_dau_snapshot_bounds failed: %s", e)
+        return {"first_day": "", "last_day": "", "days": 0}
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -1518,8 +1715,9 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
     fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic → claude；openai → codex (native)；其余 fit provider
-    （deepseek/gemini/openrouter/openai_compatible）→ pi。
+    anthropic/deepseek → claude（deepseek 走其 /anthropic 兼容层，Anthropic wire）；
+    openai → codex (native)；其余 fit provider
+    （gemini/openrouter/openai_compatible）→ pi。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
@@ -1535,6 +1733,7 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
+                    WHEN 'deepseek'  THEN 'claude'
                     WHEN 'openai'    THEN 'codex'
                     ELSE 'pi'
                   END AS driver,

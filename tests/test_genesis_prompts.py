@@ -27,6 +27,23 @@ def test_fact_write_prompt_preserves_identity_firewall():
     assert payload["fact_digest"] == [{"summary": "用户喜欢草莓拿铁"}]
 
 
+def test_memory_recheck_prompt_is_grounded_and_memory_only():
+    messages = prompts.memory_recheck_messages(
+        "用户说自己养了一只叫蛋子的狗。",
+        [{"summary": "用户住在杭州"}],
+        ["用户喜欢草莓拿铁"],
+    )
+    system = messages[0]["content"]
+    assert "收口二次检查" in system
+    assert "绝不编造" in system
+    assert "不要输出 identity" in system
+    assert '{"memories"' in system
+    payload = json.loads(messages[1]["content"])
+    assert payload["original_material"] == "用户说自己养了一只叫蛋子的狗。"
+    assert payload["written_memories"] == [{"summary": "用户住在杭州"}]
+    assert payload["known_memories"] == ["用户喜欢草莓拿铁"]
+
+
 def test_fact_map_prompt_names_user_profile_source_firewall():
     messages = prompts.fact_map_messages("source_kind=user_profile\n用户叫 Seven。")
     assert "source_kind=user_profile" in messages[0]["content"]

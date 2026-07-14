@@ -140,6 +140,7 @@
 | `do_not_say_must_be_list` | 400 | — | 同上 | |
 | `stable_definitions_must_be_list` | 400 | — | 同上 | |
 | `envelope_not_allowed` | 400 | — | identity.replace 不接受直接传 envelope | |
+| `identity_base_stale` | 409 | — | identity.replace 带基线且期间发生过全量替换(P5 乐观并发) | |
 | `identity_replace_requires_resident_distill_context` | 403 | — | | |
 | `not_a_live_resident_distill_job` | 403 | — | | |
 | `identity_required` | 400 | — | | |

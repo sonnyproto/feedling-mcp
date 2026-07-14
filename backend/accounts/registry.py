@@ -446,6 +446,12 @@ def _set_user_timezone(user_id: str, tz: str | None) -> bool:
     with _users_lock:
         for u in _users:
             if u.get("user_id") == user_id:
+                # Unchanged value is a pure no-op. iOS re-reports the same zone
+                # on every app-presence device event (~1/min/device), and each
+                # persist here is a users-row upsert + TEE mirror + a cross-worker
+                # broadcast that makes EVERY worker reload the whole registry.
+                if value == str(u.get("timezone") or ""):
+                    return True
                 if value:
                     u["timezone"] = value
                 else:

@@ -405,6 +405,121 @@ def test_admin_data_track_dau_aggregates_app_sessions_by_beijing_day():
     assert by_day["2030-06-04"]["session_dau"] == 0
 
 
+def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback():
+    old_live = _uid()
+    frozen_chat = _uid()
+    frozen_tracking = _uid()
+    today_live = _uid()
+    for uid in (old_live, frozen_chat, frozen_tracking, today_live):
+        seed_user(uid)
+
+    day2 = _epoch("2042-08-09T18:00:00Z")  # Beijing 2042-08-10 (pre-boundary)
+    day3_chat = _epoch("2042-08-10T17:00:00Z")
+    day3_tracking = _epoch("2042-08-10T18:00:00Z")
+    day4 = _epoch("2042-08-11T17:00:00Z")  # Beijing 2042-08-12 (today at first tick)
+    now_day4 = _epoch("2042-08-12T04:00:00+08:00")
+
+    db.log_append(old_live, "tracking_events", {"type": "app_open"}, ts=day2)
+    db.chat_append(
+        frozen_chat,
+        f"frozen_chat_{frozen_chat}",
+        day3_chat,
+        {"id": f"frozen_chat_{frozen_chat}", "role": "user", "source": "chat"},
+        max_messages=0,
+    )
+    db.log_append(
+        frozen_tracking,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 120}},
+        ts=day3_tracking,
+    )
+    db.log_append(today_live, "tracking_events", {"type": "app_open"}, ts=day4)
+
+    pool = db.get_pool()
+    with pool.connection() as conn:
+        conn.execute(
+            "DELETE FROM dau_daily_snapshot WHERE day BETWEEN %s AND %s",
+            ("2042-08-10", "2042-08-13"),
+        )
+
+    try:
+        # First run establishes the rollout boundary at yesterday only. Older
+        # history remains live/understated; today must never be frozen.
+        assert db.freeze_completed_dau_days(now_epoch=now_day4) == ["2042-08-11"]
+        assert db.admin_dau_snapshot_bounds() == {
+            "first_day": "2042-08-11",
+            "last_day": "2042-08-11",
+            "days": 1,
+        }
+        rows = db.admin_data_track_dau(days=10)
+        by_day = {row["day"]: row for row in rows}
+        assert by_day["2042-08-10"]["frozen"] is False  # before boundary
+        assert by_day["2042-08-11"]["frozen"] is True
+        assert by_day["2042-08-11"]["dau"] == 2
+        assert by_day["2042-08-11"]["session_count"] == 1
+        assert by_day["2042-08-11"]["foreground_sec"] == 120
+        assert by_day["2042-08-12"]["frozen"] is False  # current Beijing day
+        with pool.connection() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM dau_daily_snapshot WHERE day = %s",
+                ("2042-08-12",),
+            ).fetchone()[0] == 0
+
+        # An intraday since cuts through the frozen day, so exact legacy filter
+        # semantics win and that one day is computed live instead of using the
+        # full-day snapshot.
+        partial = db.admin_data_track_dau(since_epoch=day3_tracking, days=10)
+        partial_day3 = {row["day"]: row for row in partial}["2042-08-11"]
+        assert partial_day3["frozen"] is False
+        assert partial_day3["dau"] == 1
+
+        # Hard-delete both users behind the completed day. Its frozen metrics
+        # and timestamps remain available and unchanged.
+        db.delete_user(frozen_chat)
+        db.delete_user(frozen_tracking)
+        frozen_after_delete = {
+            row["day"]: row for row in db.admin_data_track_dau(days=10)
+        }["2042-08-11"]
+        assert frozen_after_delete["frozen"] is True
+        assert frozen_after_delete["dau"] == 2
+        assert frozen_after_delete["session_count"] == 1
+        assert frozen_after_delete["last_ts"] == day3_tracking
+
+        # Existing rows are never overwritten, even when a later tick catches
+        # up additional completed days after downtime.
+        with pool.connection() as conn:
+            conn.execute(
+                "UPDATE dau_daily_snapshot SET dau = 77 WHERE day = %s",
+                ("2042-08-11",),
+            )
+        now_day6 = _epoch("2042-08-14T04:00:00+08:00")
+        assert db.freeze_completed_dau_days(now_epoch=now_day6) == [
+            "2042-08-12",
+            "2042-08-13",
+        ]
+        assert db.freeze_completed_dau_days(now_epoch=now_day6) == []
+        with pool.connection() as conn:
+            assert conn.execute(
+                "SELECT dau FROM dau_daily_snapshot WHERE day = %s",
+                ("2042-08-11",),
+            ).fetchone()[0] == 77
+            # No-activity days are still snapshotted to make the boundary and
+            # catch-up range durable, but are omitted from the active-day API.
+            assert conn.execute(
+                "SELECT active_events FROM dau_daily_snapshot WHERE day = %s",
+                ("2042-08-13",),
+            ).fetchone()[0] == 0
+        by_day = {row["day"]: row for row in db.admin_data_track_dau(days=10)}
+        assert by_day["2042-08-12"]["frozen"] is True
+        assert "2042-08-13" not in by_day
+    finally:
+        with pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM dau_daily_snapshot WHERE day BETWEEN %s AND %s",
+                ("2042-08-10", "2042-08-13"),
+            )
+
+
 def test_log_patch_item_only_if_status():
     uid = _uid()
     seed_user(uid)

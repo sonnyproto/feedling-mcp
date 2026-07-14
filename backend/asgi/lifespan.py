@@ -16,6 +16,7 @@ for the once-per-master items). Reconciliation table (plan §8.1 / §3.3):
 | `core_wake_bus.start_listener()`            | this lifespan (always — cross-worker poll wake)|
 | `core_leader.run_singleton("ws", ...)`      | this lifespan (gated: FEEDLING_ASGI_BACKGROUND)|
 | `core_leader.run_singleton("qa-synthetic-reaper", ...)` | this lifespan (gated: QA env)|
+| `core_leader.run_singleton("dau-snapshot")` | this lifespan (same background gate)          |
 
 Only the :9998 WS-leader election is gated OFF by default, so the dev-time
 parallel instance (:5005, plan §8) sharing the live backend's DB does not
@@ -71,6 +72,14 @@ def _start_qa_synthetic_reaper_leader() -> None:
     from core import leader as core_leader
 
     core_leader.run_singleton("qa-synthetic-reaper", qa_synthetic_accounts.start)
+
+
+def _start_dau_snapshot_leader() -> None:
+    """Freeze completed Beijing-day DAU rows on exactly one backend worker."""
+    from admin import dau_snapshot_scheduler
+    from core import leader as core_leader
+
+    core_leader.run_singleton("dau-snapshot", dau_snapshot_scheduler.start)
 
 
 @asynccontextmanager
@@ -133,6 +142,7 @@ async def lifespan(app):
     # (6) :9998 WS-leader election — gated (see module docstring).
     if settings.start_background:
         _start_ws_leader()
+        _start_dau_snapshot_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from tee_shadow import mirror as _tee_mirror
 
