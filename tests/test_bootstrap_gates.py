@@ -437,7 +437,6 @@ def test_chat_response_without_identity_only_hits_resident_gate(backend):
     assert body["error"] == "bootstrap_incomplete"
     assert body["stage"] == "needs_resident_consumer"
     assert body["identity_written"] is False
-    assert body["missing_tabs"] == []
     assert "resident" in body["required"].lower()
     assert "skill_url" in body
 

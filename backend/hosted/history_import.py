@@ -2293,7 +2293,6 @@ def _fallback_memory_cards(
 
 
 def _import_memory_targets(
-    floors: dict,
     history_messages: list[dict],
     support_messages: list[dict],
     profile: dict | None = None,
@@ -2338,7 +2337,6 @@ def _import_memory_targets(
         "total_windows": int(cfg["total_windows"]),
         "chat_ready_cards": int(cfg["chat_ready_cards"]),
         "background": bool(cfg["background"]),
-        "floor_reference": floors,
         "source_stats": source_stats,
     }
 
@@ -2958,7 +2956,7 @@ def _process_history_import_sync(
         support_messages,
         content_chars=len(content),
     )
-    import_targets = _import_memory_targets(floors, history_messages, support_messages, profile)
+    import_targets = _import_memory_targets(history_messages, support_messages, profile)
     language = _import_language_for_store(store, analysis_messages)
     windows = _build_transcript_windows(
         analysis_messages,
