@@ -775,6 +775,7 @@ def init_identity_if_absent(
         "owner_user_id": envelope["owner_user_id"],
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
+        "replaced_at": now,
         "relationship_started_at": _relationship_anchor_from_output(store, output, days_int),
         "relationship_anchor_source": GENESIS_SOURCE,
         "relationship_anchor_evidence": evidence,

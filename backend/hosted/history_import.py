@@ -2794,6 +2794,7 @@ def _store_identity_payload(
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") if existing else now,
         "updated_at": now,
+        "replaced_at": now,
         # Documented priority ("如果你填了日期就用你的;留空才用最早记忆;都没有用今天"):
         # an EXPLICIT relationship_started_at (the user typed a date) wins and is used
         # verbatim. Only when it's blank do we fall back to prefer_memory (earliest memory

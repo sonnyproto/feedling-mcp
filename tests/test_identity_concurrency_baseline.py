@@ -29,6 +29,8 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
+from genesis import service as genesis_service  # noqa: E402
+from hosted import history_import  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -206,6 +208,85 @@ def test_identity_replace_action_changes_replaced_at(client, monkeypatch):
     saved = db.get_blob(user_id, "identity")
     assert saved.get("replaced_at")
     assert saved["replaced_at"] != _SEEDED_REPLACED_AT
+
+
+def test_init_identity_if_absent_stamps_replaced_at_on_init(client, monkeypatch):
+    # Genesis import path (no prior identity): genesis_service.init_identity_if_absent
+    # builds its own explicit-field identity dict and raw-saves via
+    # identity_service._save_identity, independent of identity_core.init_identity.
+    # It must stamp replaced_at from the same `now` as created_at/updated_at too.
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    monkeypatch.setattr(genesis_service.core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+
+    status = genesis_service.init_identity_if_absent(
+        store,
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
+            },
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_evidence": "persona card named Mira",
+        },
+    )
+    assert status == "initialized"
+    saved = db.get_blob(user_id, "identity")
+    assert saved.get("replaced_at")
+    assert saved["replaced_at"] == saved["created_at"] == saved["updated_at"]
+
+
+def test_init_identity_if_absent_stamps_replaced_at_on_update(client, monkeypatch):
+    # Genesis "update" branch (existing identity, still genesis-owned): must move
+    # replaced_at just like the envelope /v1/identity/replace route does.
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    _seed_identity(user_id)
+    db.set_blob(user_id, "identity", {**db.get_blob(user_id, "identity"), "relationship_anchor_source": genesis_service.GENESIS_SOURCE})
+    monkeypatch.setattr(genesis_service.core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+    monkeypatch.setattr(
+        genesis_service,
+        "_existing_identity_plain_for_update",
+        lambda *_a, **_k: (None, "identity_plain_not_available"),
+    )
+
+    status = genesis_service.init_identity_if_absent(
+        store,
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
+            },
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_evidence": "persona card named Mira",
+        },
+    )
+    assert status == "updated"
+    saved = db.get_blob(user_id, "identity")
+    assert saved.get("replaced_at")
+    assert saved["replaced_at"] != _SEEDED_REPLACED_AT
+
+
+def test_store_identity_payload_stamps_replaced_at(client, monkeypatch):
+    # hosted/history_import.py::_store_identity_payload (Model API history import):
+    # same shape as the two genesis paths above - explicit-field dict, raw-save via
+    # identity_service._save_identity. Must also stamp replaced_at.
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    monkeypatch.setattr(history_import.core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+
+    identity = history_import._store_identity_payload(
+        store,
+        _plain_identity(),
+        days_with_user=10,
+        evidence="history_import:job_1 relationship_started_at=2026-06-01",
+        language="en",
+        relationship_started_at="2026-06-01",
+    )
+    assert identity.get("replaced_at")
+    assert identity["replaced_at"] == identity["created_at"] == identity["updated_at"]
+    saved = db.get_blob(user_id, "identity")
+    assert saved["replaced_at"] == identity["replaced_at"]
 
 
 # --------------------------------------------------------------------------- #
