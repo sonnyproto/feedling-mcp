@@ -93,3 +93,54 @@ def test_pool_timeout_env_configurable(monkeypatch):
     assert mirror._pool_timeout() == 30.0
     monkeypatch.setenv("FEEDLING_TEE_POOL_TIMEOUT", "garbage")
     assert mirror._pool_timeout() == 2.0  # bad value falls back to default
+
+
+def test_statement_timeout_env_configurable(monkeypatch):
+    """服务端语句执行上限。补 connect_timeout/keepalives 盖不住的挂死:连接已建好、
+    query 已到 pg,但网关黑洞回包 → 客户端无限等 recv。有了它 pg 到点自 cancel,
+    reconcile 干净失败并释放 run-lock,而非永久 wedge 住 scheduler(2026-07-14 事故)。
+    默认 120s 够 prod user_logs(376MB)reconcile 的全 PK prune/count 跑完。"""
+    from tee_shadow import mirror
+    monkeypatch.delenv("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", raising=False)
+    assert mirror._statement_timeout_ms() == 120000
+    monkeypatch.setenv("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", "45000")
+    assert mirror._statement_timeout_ms() == 45000
+    monkeypatch.setenv("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", "garbage")
+    assert mirror._statement_timeout_ms() == 120000  # bad value → default
+    monkeypatch.setenv("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", "10")
+    assert mirror._statement_timeout_ms() == 1000  # floored at 1s
+
+
+def test_tcp_user_timeout_env_configurable(monkeypatch):
+    """出站未 ACK 上限(Linux 内核强杀连接)。补反方向挂死:出站被网关黑洞、根本没
+    送达 pg,服务端没 query 可 statement_timeout cancel,keepalives 又被网关 TCP 层
+    回探测骗过。默认 30s;0 = 关闭(交系统默认),此时不下发该 kwarg。"""
+    from tee_shadow import mirror
+    monkeypatch.delenv("FEEDLING_TEE_TCP_USER_TIMEOUT_MS", raising=False)
+    assert mirror._tcp_user_timeout_ms() == 30000
+    monkeypatch.setenv("FEEDLING_TEE_TCP_USER_TIMEOUT_MS", "15000")
+    assert mirror._tcp_user_timeout_ms() == 15000
+    monkeypatch.setenv("FEEDLING_TEE_TCP_USER_TIMEOUT_MS", "0")
+    assert mirror._tcp_user_timeout_ms() == 0  # 显式关闭
+    monkeypatch.setenv("FEEDLING_TEE_TCP_USER_TIMEOUT_MS", "garbage")
+    assert mirror._tcp_user_timeout_ms() == 30000  # bad value → default
+
+
+def test_pool_connection_enforces_statement_timeout(monkeypatch):
+    """接线验证(不只测 helper):从 get_tee_pool() 借出的连接必须真的带上
+    statement_timeout —— options='-c statement_timeout=' 已下发到服务端。"""
+    from tee_shadow import mirror
+    monkeypatch.setenv("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", "7000")
+    # 重建全局池,让新 kwargs 生效(其它测试可能已建过旧池)。
+    if mirror._pool is not None:
+        mirror._pool.close()
+        mirror._pool = None
+    try:
+        with mirror.get_tee_pool().connection() as conn:
+            got = conn.execute("SHOW statement_timeout").fetchone()[0]
+        assert got == "7s"  # 7000ms 服务端归一化为 '7s'
+    finally:
+        # 别把这条 7s 上限的池留给后续测试:关掉,下次 get_tee_pool 用默认重建。
+        if mirror._pool is not None:
+            mirror._pool.close()
+            mirror._pool = None
