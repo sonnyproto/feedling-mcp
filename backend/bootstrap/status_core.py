@@ -37,9 +37,9 @@ def bootstrap_status_payload(store: UserStore) -> dict:
     # the gap so the App/agent can see it. A fresh 0-day account sitting below
     # the trivial floor (2) is expected and fine — nothing here blocks
     # onboarding or chat.
-    memory_floor = memory_service._memory_floor_for_days(
-        identity_service._relationship_age_days(store)
-    )
+    relationship_age_days = identity_service._relationship_age_days(store)
+    memory_floor = memory_service._memory_floor_for_days(relationship_age_days)
+    memory_aspiration = memory_service._memory_aspiration_for_days(relationship_age_days)
     memory_below_floor = bool(memory_count < memory_floor)
     last_moment_ts = ""
     if memory_count > 0:
@@ -110,6 +110,7 @@ def bootstrap_status_payload(store: UserStore) -> dict:
         "relationship_anchored": relationship_anchored,
         "memories_count": memory_count,
         "memory_floor": memory_floor,
+        "memory_aspiration": memory_aspiration,
         "memory_below_floor": memory_below_floor,
         "agent_messages_count": agent_msg_count,
         "chat_loop_verified": chat_loop_verified,
