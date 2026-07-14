@@ -1,0 +1,83 @@
+---
+title: Authentication
+description: Authenticate as a Feedling user or a scoped hosted runtime.
+---
+
+import { ClearPlaygroundCredentials } from '@/components/clear-playground-credentials';
+
+Feedling has two credential types. They are not interchangeable.
+
+| Credential | Header | Intended caller |
+| --- | --- | --- |
+| User API key | `X-API-Key` | User-owned apps, devices, and control-plane integrations |
+| Runtime token | `X-Feedling-Runtime-Token` | Feedling-hosted runtime processes with explicit scopes |
+
+## User API keys
+
+An API key authenticates one Feedling user. Send it in a header on every
+protected request:
+
+```http
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+Treat the value as opaque. Keep it out of source control, client-side analytics,
+URLs, crash reports, and logs. Do not use the legacy query-string credential
+form: URLs commonly leak into browser history, proxy logs, and referrer data.
+
+See [API key lifecycle](/docs/api-keys) for registration, issuing a key to
+another device, keypair recovery, and the current rotation and revocation
+limitations.
+
+## Runtime tokens
+
+Hosted agent runtimes use short-lived, user-bound bearer tokens with explicit
+scopes:
+
+```http
+X-Feedling-Runtime-Token: RUNTIME_TOKEN
+```
+
+Runtime tokens are issued by Feedling infrastructure. There is no public API for
+an end-user client to mint one. Some control-plane endpoints deliberately require
+an API key, and a valid runtime token can still receive `403` there.
+
+Do not send both credential headers. If an operation specifically requires an
+API key, use only `X-API-Key`.
+
+## Playground credential storage
+
+When you enter a credential in the API playground, the documentation site saves
+the authentication field in this origin's `localStorage` so it can be reused on
+other endpoint pages. It is not placed in the page URL, but any script running on
+this origin can access it. Do not enter a production key on a shared or untrusted
+browser profile.
+
+The button below removes only keys whose names start with
+`fumadocs-openapi-auth-`. It does not clear unrelated local storage for the site.
+Reload any endpoint page that was already open, because its form can still hold
+the old value in memory.
+
+<ClearPlaygroundCredentials />
+
+You can perform the same scoped cleanup in the browser console:
+
+```js
+for (const key of Object.keys(localStorage)) {
+  if (key.startsWith('fumadocs-openapi-auth-')) localStorage.removeItem(key);
+}
+```
+
+Alternatively, clear all stored data for `docs.feedling.app` in the browser's
+site settings. Closing a tab or a private window is not a substitute unless the
+browser is configured to discard that profile's site data.
+
+## Authentication failures
+
+- `401 unauthorized` means the credential is missing, invalid, expired, or was
+  invalidated with its account.
+- `403 forbidden` means the credential is valid but cannot perform that action,
+  or the runtime token lacks the required scope.
+
+Clients should branch on the response's machine-readable `error` value. Retain
+`request_id` when it is present and you need to diagnose a server failure.

@@ -1,0 +1,215 @@
+---
+title: Architecture and trust boundaries
+description: Understand Feedling's components, data flows, encryption boundaries, tenant isolation, and readiness model.
+---
+
+import { ArchitectureDiagram } from '@/components/architecture-diagram';
+
+Feedling separates ciphertext persistence from authorized decryption and agent
+execution. Managed production uses a main confidential VM for the public API and
+trusted-decrypt service, separate confidential-VM capacity for hosted agents,
+and external persistence and delivery services.
+
+This page describes the stable logical boundaries. Exact instance counts,
+regions, image digests, and provider choices are deployment details rather than
+part of the public API contract.
+
+## System at a glance
+
+<ArchitectureDiagram />
+
+The managed main deployment runs TLS ingress, the ASGI API, and the attested
+decrypt service as separate services inside one measured confidential-VM
+boundary. Hosted runners can scale in separate confidential VMs and reach the
+main API and decrypt service with short-lived, user-bound runtime tokens.
+
+Self-hosted deployments can place the same logical components on one machine,
+but process separation on a generic host is not equivalent to a hardware-backed
+confidential-VM boundary. See [self-hosting](/docs/self-hosting) before choosing a
+deployment topology.
+
+## Components and responsibilities
+
+| Component | Primary responsibility | Data it can handle |
+| --- | --- | --- |
+| Client app or integration | Own the user credential and content keypair; call HTTP or WebSocket operations | Plaintext created or displayed by that client, plus encrypted envelopes |
+| TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
+| ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
+| Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
+| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Encrypted protected bodies plus plaintext IDs, timestamps, types, status, and other operational metadata |
+| Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
+| Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
+| Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
+
+The component that stores a record is therefore not always the component that
+can interpret its protected body. Conversely, “encrypted at rest” does not mean
+that every identifier, status field, compatibility payload, normalized signal,
+or diagnostic upload is encrypted.
+
+## Core data flows
+
+### Hosted Chat
+
+1. The client sends a message or attachment over HTTPS to
+   `POST /v1/model_api/chat/send`.
+2. Inside the managed main VM, the API validates the request, creates a shared
+   encrypted envelope, appends the user turn, and wakes the hosted queue.
+3. A per-user runner process polls with a scoped runtime token. It requests only
+   the Chat, Memory, and Perception context authorized for that user.
+4. The decrypt service opens the required shared envelopes. The runner sends the
+   plaintext prompt and selected context to the configured model provider.
+5. The runner encrypts the assistant result into a new user-owned envelope before
+   it is persisted. The original send remains asynchronous and returns `202`.
+
+The model provider is an external plaintext recipient. Envelope encryption
+protects persisted content and the storage path; it does not hide the prompt
+from the model selected to process it. When visible push text is enabled, that
+notification text also passes through the external push provider.
+
+An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
+uses the same encrypted queue-and-reply protocol but runs in infrastructure the
+user or integrator controls instead of Feedling's hosted runner.
+
+### Memory
+
+1. A client writes a Memory envelope. `shared` records wrap the content key for
+   both the user and the trusted decrypt service; `local_only` records omit the
+   enclave-wrapped key.
+2. PostgreSQL stores the encrypted body and the plaintext ordering and
+   classification metadata required by the API.
+3. `memory/index` and `memory/fetch` send authorized candidate envelopes to the
+   decrypt service and return only the requested projection.
+4. A `local_only` body remains client-readable but is unavailable to agent-side
+   index and fetch operations.
+
+See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
+selection, fetch, and action contracts.
+
+### Perception and screen content
+
+Sensitive Perception signals and photo bodies use encrypted envelopes. Ordinary
+operational context fields can be submitted as plaintext. Encrypted sensitive
+signals are opened for authorized processing, after which normalized state and
+metadata can be persisted separately from the original body. The legacy
+collection branch stores each `doc` as provided.
+
+Screen pixels use encrypted frame envelopes; large frame ciphertext can be
+offloaded to object storage without giving that store the content key. The
+authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
+history, and long polling.
+
+Heavy Chat bodies—image and file ciphertext—can be offloaded the same way. The
+message row keeps its envelope metadata plus a pointer, and the ciphertext is
+re-fetched from object storage only at the exits that actually deliver a body.
+The object store receives ciphertext and never receives the content key, so this
+does not move the decrypt boundary. It does make the object store part of the
+read path: a body that is unreachable there degrades that one message rather
+than the conversation.
+
+The [Perception workflow](/docs/workflows/perception) identifies the encrypted,
+plaintext, and legacy compatibility branches. Clients should choose the
+encrypted branch for new sensitive integrations rather than assuming every
+Perception payload has the same privacy properties.
+
+## Envelope and decrypt boundary
+
+A protected v1 envelope separates one encrypted body from two possible readers:
+
+| Field | Meaning |
+| --- | --- |
+| `body_ct` and `nonce` | Authenticated ciphertext and its nonce |
+| `K_user` | Per-record content key wrapped to the user's content public key |
+| `K_enclave` | The same content key wrapped to the trusted decrypt service; required for `shared` visibility |
+| `owner_user_id` | Plaintext tenant binding checked against the authenticated caller |
+| `enclave_pk_fpr` | Identifies the content public key used for the enclave wrap |
+
+`K_user` lets an authorized device decrypt without the service. `K_enclave` lets
+the measured decrypt service open only the records needed by shared agent
+workflows. Attestation-aware clients can verify that the live content public key
+and measured deployment match the service they intend to trust.
+
+This is dual-recipient envelope encryption, not a claim that no server-side
+component ever sees plaintext. Hosted Chat, enclave-backed read projections,
+normalized Perception processing, user-approved diagnostics, and external
+inference each have an explicit plaintext boundary.
+
+## Authentication and credential roles
+
+| Credential | Scope and lifetime | Where it is used |
+| --- | --- | --- |
+| User API key | Long-lived, full access to one user's public control and data plane | User-owned apps, integrations, and control-plane operations |
+| Runtime token | Short-lived, user-bound, and scope-limited | Hosted runner processes and background workers |
+| Provider credential | Belongs to the configured external inference provider | Encrypted at rest, then decrypted for the authorized per-user runner process that calls the provider |
+
+Runtime tokens do not replace API keys. Key issuance, account reset, MCP
+management, and other designated control-plane operations require the user API
+key even when a valid runtime token exists. See [authentication](/docs/authentication)
+and [API key lifecycle](/docs/api-keys) for the current issuance and revocation
+limitations.
+
+## Tenant and execution isolation
+
+The public API resolves each credential to one user, scopes storage queries by
+that user, and checks envelope ownership before protected reads and writes. This
+is the primary multi-tenant boundary for API and persistence access.
+
+Managed hosted runners additionally use per-user homes, sessions, checkpoints,
+leases, and child processes. The current process runner is an operational
+separation mechanism, not a strong sandbox for mutually hostile code. Child
+processes share the runner container and kernel, inherit the supervisor's base
+environment, and receive the provider credential needed for their configured
+agent.
+
+Feedling does not represent this as per-user microVM or per-user hardware-enclave
+isolation. Keep hosted execution restricted to supported agent entry points, and
+use a separately reviewed container or microVM boundary before offering
+arbitrary untrusted code execution to unrelated tenants.
+
+## Managed and self-hosted trust models
+
+| Deployment | Confidential-compute guarantee | Appropriate boundary |
+| --- | --- | --- |
+| Managed production | Main and hosted-runner workloads can run in measured confidential VMs; the decrypt service exposes attestation evidence | Multi-user API with the documented runner isolation limitations |
+| Single-operator self-host | Depends on the operator's host and configuration | One user, family, or organization that trusts the operator |
+| Generic local development | Software processes on one developer machine | Test identities and non-production data |
+
+Running the decrypt service on an ordinary VPS preserves the envelope format but
+does not protect its private key from that machine's operator. Achieving managed
+production parity also requires measured deployment, key lifecycle, network
+policy, secret distribution, backups, monitoring, and incident response.
+
+## Health and capability readiness
+
+`GET /healthz` currently proves that the API process can answer an HTTP request.
+It does not query PostgreSQL, complete an enclave decrypt, verify a live runner,
+call a model provider, test object storage, start the screen WebSocket, or
+deliver a push notification.
+
+Readiness should therefore be evaluated per enabled capability:
+
+| Capability | Minimum end-to-end readiness evidence |
+| --- | --- |
+| Account and storage API | Authenticated request plus a successful write/read round trip through PostgreSQL |
+| Memory index and fetch | Storage round trip plus a successful authorized decrypt projection |
+| Hosted Chat | Database, decrypt service, fresh supervisor heartbeat, queue processing, provider call, and encrypted assistant result |
+| Screen ingestion | Authenticated WebSocket ingest plus frame persistence and, when needed, decrypt retrieval |
+| Push delivery | Valid device token and a confirmed provider delivery attempt |
+
+There is no single public `/readyz` endpoint that proves all of these
+dependencies. Operators should compose synthetic, non-production probes for the
+capabilities they enable and keep `/healthz` as a lightweight liveness signal.
+
+## Security boundary summary
+
+Feedling's architecture is designed to provide:
+
+- user-scoped API and storage access;
+- ciphertext-at-rest protected bodies for the documented envelope workflows;
+- an attested trusted-decrypt boundary in the managed deployment;
+- short-lived, scoped credentials for hosted execution; and
+- explicit handoff to user-selected external inference and delivery services.
+
+It does not claim that every field or compatibility upload is encrypted, that a
+shared runner child process is a hostile-code sandbox, that external model
+providers cannot see inference plaintext, or that process liveness proves full
+service readiness.

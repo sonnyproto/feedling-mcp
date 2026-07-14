@@ -88,6 +88,37 @@ def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
 
 
+def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
+    env = spawners.consumer_env(
+        {"PATH": "/bin"},
+        {
+            "api_key": "fk",
+            "provider": "deepseek",
+            "provider_key": "sk-ds",
+            "driver": "claude",
+            "model": "deepseek-v4-pro",
+        },
+        user_id="u_1",
+        home="/agent-data/users/u_1",
+    )
+
+    cmd = env["AGENT_CLI_CMD"]
+    assert "--output-format stream-json" in cmd
+    assert "--include-partial-messages" in cmd
+    assert "--effort high" in cmd
+    assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
+    # the thinking-claude command must ALSO grant Read on the image temp dir, or a
+    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p).
+    # DOUBLE leading slash: a single slash anchors at the settings source (cwd /app),
+    # so Read(/agent-data/...) resolves to /app/agent-data/... and never matches.
+    assert "Read(//agent-data/users/u_1/images/**)" in cmd
+    # --add-dir puts the out-of-cwd image dir inside claude's trusted workspace, so
+    # the Read is permitted even under the headless workspace-trust boundary.
+    assert "--add-dir /agent-data/users/u_1/images" in cmd
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
+
+
 def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
@@ -432,20 +463,21 @@ def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs
     assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
-def test_consumer_env_claude_deepseek_no_longer_overrides_anthropic_endpoint():
-    # deepseek moved to the pi driver (anthropic-messages); the claude driver's
-    # old /anthropic-compatible base-URL override for it is retired, so even an
-    # (unreachable in production) driver=claude+provider=deepseek entry now
-    # behaves like any other claude entry — no override.
+def test_consumer_env_claude_deepseek_points_at_anthropic_compat_endpoint():
+    # deepseek runs on the claude (Anthropic-wire) driver but is NOT anthropic:
+    # the CLI must be pointed at deepseek's /anthropic-compatible endpoint + its
+    # own model, else it hits api.anthropic.com with a foreign key → exit 1.
     env = spawners.consumer_env(
         {}, {"driver": "claude", "provider": "deepseek", "model": "deepseek-v4-flash",
              "base_url": "https://api.deepseek.com", "provider_key": "sk-ds"},
         user_id="u_1", home="/h",
     )
-    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
     assert env["ANTHROPIC_API_KEY"] == "sk-ds"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
-    assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
+    # claude Code's background "small/fast" calls must use the deepseek model too,
+    # not a claude-* default the endpoint doesn't serve.
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
 
 
 def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
@@ -816,7 +848,6 @@ def test_pi_models_json_loads_and_enables_reasoning_in_real_pi(tmp_path):
     assert thinking_col("openrouter", "off") == "no"          # explicit off disables
     assert thinking_col("openai_compatible", "medium") == "yes"
     assert thinking_col("gemini", "medium") == "yes"          # LOADS (baseUrl present)
-    assert thinking_col("deepseek", "") == "no"               # text-only, no reasoning
 
 
 def test_pi_consumer_env_sets_provider_key():
@@ -916,16 +947,49 @@ def test_pi_models_openai_compatible_uses_user_base():
     assert p["api"] == "openai-completions" and p["baseUrl"] == "https://my/v1"
 
 
-def test_pi_models_deepseek_anthropic_messages_text_only():
-    p = _prov("deepseek", model="deepseek-reasoner", base_url="")
-    assert p["api"] == "anthropic-messages"
-    assert p["baseUrl"] == "https://api.deepseek.com/anthropic"
-    assert "compat" not in p and p["models"][0]["input"] == ["text"]
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai_compatible", "https://relay.example/v1"),
+        ("openrouter", ""),
+        ("gemini", ""),
+    ],
+)
+def test_pi_models_json_pins_max_tokens(provider, base_url):
+    """EVERY branch must pin ``maxTokens``, or pi fills its own 16384 default
+    (pi-coding-agent model-registry: ``maxTokens: modelDef.maxTokens ?? 16384``).
+
+    That default is what breaks low-budget users: relays pre-authorize against the
+    requested max_tokens, and an OpenRouter key with a total-limit simply 402s —
+    observed live as ``pi agent produced no reply: 402: You requested up to 16384
+    tokens, but can only afford 1698``. pi exposes no --max-tokens flag, so the
+    model entry is the ONLY lever."""
+    p = _prov(provider, model="m", base_url=base_url)
+    assert p["models"][0]["maxTokens"] == spawners._pi_max_tokens()
 
 
-def test_pi_models_deepseek_custom_base():
-    p = _prov("deepseek", model="deepseek-chat", base_url="https://ds.example.com/")
-    assert p["baseUrl"] == "https://ds.example.com/anthropic"
+def test_pi_max_tokens_env_override(monkeypatch):
+    monkeypatch.setenv("FEEDLING_PI_MAX_TOKENS", "2048")
+    assert spawners._pi_max_tokens() == 2048
+    p = _prov("openai_compatible", model="m", base_url="https://r/v1")
+    assert p["models"][0]["maxTokens"] == 2048
+
+
+def test_pi_max_tokens_stays_above_the_thinking_budget():
+    """Guard the footgun: pi reserves a thinking budget by level (medium = 8192) and
+    clamps with ``if maxTokens <= thinkingBudget: thinkingBudget = maxTokens - 1024``.
+    So a maxTokens at/below the budget silently collapses thinking to 1024 tokens.
+    Our default ships with thinking ON at medium (``_PI_REASONING_DEFAULT``), so the
+    default maxTokens must leave room for both. Lowering it is a deliberate act —
+    do it via FEEDLING_PI_MAX_TOKENS, and lower --thinking with it."""
+    assert spawners._pi_max_tokens() > 8192
+
+
+def test_pi_max_tokens_rejects_garbage(monkeypatch):
+    monkeypatch.setenv("FEEDLING_PI_MAX_TOKENS", "not-a-number")
+    assert spawners._pi_max_tokens() == spawners._PI_MAX_TOKENS_DEFAULT
+    monkeypatch.setenv("FEEDLING_PI_MAX_TOKENS", "0")
+    assert spawners._pi_max_tokens() == spawners._PI_MAX_TOKENS_DEFAULT
 
 
 # NATIVE REASONING (no gateway):
@@ -961,7 +1025,61 @@ def test_pi_openai_compatible_reasoning_default_on_off_when_explicit():
     assert p["compat"]["supportsReasoningEffort"] is True and _model_reasoning(p) is True
 
 
-def test_claude_anthropic_base_url_empty_for_all():
+def test_claude_anthropic_base_url_deepseek_compat_endpoint():
+    # Native anthropic keeps the CLI default (no override); deepseek gets its
+    # /anthropic-compatible endpoint (custom base_url honored, default otherwise).
     assert spawners._claude_anthropic_base_url({"provider": "anthropic"}) == ""
     assert spawners._claude_anthropic_base_url(
-        {"provider": "deepseek", "base_url": "https://api.deepseek.com"}) == ""
+        {"provider": "deepseek", "base_url": "https://api.deepseek.com"}
+    ) == "https://api.deepseek.com/anthropic"
+    assert spawners._claude_anthropic_base_url(
+        {"provider": "deepseek", "base_url": ""}
+    ) == "https://api.deepseek.com/anthropic"
+    assert spawners._claude_anthropic_base_url(
+        {"provider": "deepseek", "base_url": "https://ds.example.com/"}
+    ) == "https://ds.example.com/anthropic"
+
+
+# Reseller/relay marketing tags in the model id pollute the agent's self-reference.
+# Sanitize them out of the IDENTITY string only (routing keeps the raw name).
+def test_sanitize_model_name_strips_reseller_tags_for_identity():
+    s = spawners._sanitize_model_name_for_identity
+    assert s("[Kiro] claude-opus-4-6 [不补]") == "claude-opus-4-6"
+    assert s("[特价纯血]claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert s("[特特价次kiro]claude-opus-4-6-thinking") == "claude-opus-4-6-thinking"
+    assert s("【促销】gpt-4o-mini") == "gpt-4o-mini"
+    # clean ids untouched (incl. openrouter provider/model slash form + dots)
+    assert s("deepseek-v4-flash") == "deepseek-v4-flash"
+    assert s("anthropic/claude-opus-4.6") == "anthropic/claude-opus-4.6"
+    # all-tags -> empty so the identity block falls back to provider, not a tag
+    assert s("[全是标签]") == ""
+    assert s("") == ""
+
+
+def test_identity_block_uses_sanitized_model_name():
+    block = spawners._identity_override_block(
+        "openai_compatible", "[Kiro] claude-opus-4-6 [不补]", "https://relay.example/v1")
+    assert "claude-opus-4-6" in block
+    assert "[不补]" not in block          # the marketing tag never reaches self-reference
+    assert "[Kiro]" not in block
+
+
+def test_identity_block_all_tags_falls_back_to_provider():
+    block = spawners._identity_override_block(
+        "openai_compatible", "[全是标签]", "https://relay.example/v1")
+    assert "`openai_compatible`" in block
+    assert "[全是标签]" not in block
+
+
+def test_identity_sanitization_does_not_change_pi_routing_model():
+    raw_model = "[Kiro] claude-opus-4-6 [不补]"
+    files = spawners.agent_home_files(
+        "/h", driver="pi", provider="openai_compatible",
+        base_url="https://relay.example/v1", model=raw_model)
+    prompt = files["/h/agent-tools-prompt.md"]
+    models = json.loads(files["/h/pi-home/agent/models.json"])
+
+    assert "`claude-opus-4-6`" in prompt
+    assert "[Kiro]" not in prompt
+    assert "[不补]" not in prompt
+    assert models["providers"]["feedling"]["models"][0]["id"] == raw_model

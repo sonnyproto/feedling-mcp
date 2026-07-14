@@ -89,12 +89,57 @@ def _pool_max_lifetime() -> float:
         return 180.0
 
 
+def _statement_timeout_ms() -> int:
+    # 单条语句在 TEE 服务端的执行上限(毫秒),经 options='-c statement_timeout=' 下发。
+    # 补 connect_timeout/keepalives 都盖不住的一种挂死:连接已建好、query 已到达 pg,
+    # 但网关把回包黑洞掉——pg 仍在跑或已跑完却送不回来,客户端无限等 recv。有了它,
+    # pg 到点自己 cancel → 抛 QueryCanceled,reconcile 这趟干净失败并释放 run-lock,
+    # 而不是永久 wedge 住 in-process scheduler(2026-07-14 test 实测:reconcile-first
+    # 首次自动跑就卡死 28min,零 [reconcile] 日志、RDS 无 active query、TEE 库健康)。
+    #
+    # 默认 120s:够 prod user_logs(376MB)reconcile 的 prune 全 PK 扫描 / count(*) 跑完
+    # (它们是简单扫描、只取 PK 列),又能兜住真正的服务端黑洞。热镜像写是毫秒级、
+    # replicator 批写也远在其下,故单一值同时服务三条路径(mirror/replicator/reconciler)。
+    try:
+        return max(1000, int(os.environ.get("FEEDLING_TEE_STATEMENT_TIMEOUT_MS", "") or 120000))
+    except (TypeError, ValueError):
+        return 120000
+
+
+def _tcp_user_timeout_ms() -> int:
+    # 已发出的数据在被强制关连接前允许"未被 ACK"的上限(毫秒,libpq 参数,Linux-only;
+    # CVM 是 Linux)。补 statement_timeout 盖不住的反方向挂死:出站(客户端→pg)被网关
+    # 黑洞、根本没送达 pg —— 服务端没在跑任何 query,没有 statement_timeout 可 cancel,
+    # keepalives 又因网关在 TCP 层回探测而看着 socket 是活的。tcp_user_timeout 让内核在
+    # 出站数据 30s 收不到 ACK 时强杀连接 → 抛 OperationalError,同样让这趟干净失败。
+    #
+    # 默认 30s:健康连接持续被 ACK 时永不触发,只在真卡死时兜底。0 = 交给系统默认(关闭)。
+    try:
+        return max(0, int(os.environ.get("FEEDLING_TEE_TCP_USER_TIMEOUT_MS", "") or 30000))
+    except (TypeError, ValueError):
+        return 30000
+
+
 def get_tee_pool():
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
                 from psycopg_pool import ConnectionPool
+                # connect_timeout:单条连接的建立上限,防止一次网关握手无限期挂住占着
+                #   pool 的补给名额。
+                # keepalives:内核每 30s 发 TCP 探活,尽量别让网关按空闲掐断。
+                # tcp_user_timeout + statement_timeout(见上两个 helper):两个方向的
+                #   "连接建好之后才挂死"兜底——前者管出站没 ACK、后者管服务端回包被吞。
+                #   缺了它们,单条挂死的 TEE 写会永久 wedge 住 in-process scheduler 的
+                #   run-lock(reconcile-first 卡死事故)。
+                kwargs = {"autocommit": True, "connect_timeout": 10,
+                          "keepalives": 1, "keepalives_idle": 30,
+                          "keepalives_interval": 10, "keepalives_count": 3,
+                          "options": f"-c statement_timeout={_statement_timeout_ms()}"}
+                tcp_ut = _tcp_user_timeout_ms()
+                if tcp_ut:
+                    kwargs["tcp_user_timeout"] = tcp_ut
                 _pool = ConnectionPool(
                     os.environ["TEE_DATABASE_URL"],
                     min_size=_pool_min(),
@@ -104,12 +149,7 @@ def get_tee_pool():
                     # 主动回收陈连接(见 _pool_max_lifetime):min_size 的热连接不受
                     # max_idle 约束,只有 max_lifetime 能把它们在被网关掐断前换掉。
                     max_lifetime=_pool_max_lifetime(),
-                    # connect_timeout:单条连接的建立上限(libpq 参数),防止一次
-                    # 网关握手无限期挂住占着 pool 的补给名额。
-                    # keepalives:让内核每 30s 发 TCP 探活,尽量别让网关按空闲掐断。
-                    kwargs={"autocommit": True, "connect_timeout": 10,
-                            "keepalives": 1, "keepalives_idle": 30,
-                            "keepalives_interval": 10, "keepalives_count": 3},
+                    kwargs=kwargs,
                     open=True,
                 )
     return _pool

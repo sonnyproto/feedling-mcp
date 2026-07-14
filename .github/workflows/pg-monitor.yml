@@ -1,4 +1,6 @@
 # .github/workflows/pg-monitor.yml — 没有监控 = 没有备份（spec §3）
+# 监控 **prod** TEE Postgres 的 WAL-G 备份链（归档新鲜度 + WAL 堆积 + R2 落地）。
+# prod 才是真正要盯的：真实用户数据。test 库数据可弃，故不监控。
 name: PG backup monitor
 on:
   schedule: [{ cron: '*/30 * * * *' }]
@@ -14,7 +16,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
       - name: Archiver freshness + WAL 堆积（monitoring 角色，pg_monitor-only）
         env:
-          MON_DSN: ${{ secrets.TEST_PG_MONITORING_DSN }}   # host=<app-id>-5432s... port=443 user=monitoring ... sslnegotiation=direct sslmode=require
+          MON_DSN: ${{ secrets.PROD_PG_MONITORING_DSN }}   # host=<prod-pg-app-id>-5432s... port=443 user=monitoring dbname=feedling sslnegotiation=direct sslmode=require
         run: |
           PSQL=/usr/lib/postgresql/17/bin/psql
           AGE=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(EXTRACT(EPOCH FROM now()-last_archived_time)::int, 999999) FROM pg_stat_archiver;")
@@ -25,20 +27,20 @@ jobs:
           test "$WAL_MB" -lt 4096 || { echo "::error::WAL 堆积 ${WAL_MB}MB (>4GB) — 先修归档，绝不手删 pg_wal/"; exit 1; }
       - name: R2 bucket freshness
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
           # GitHub runner has no default AWS region; `aws s3api` still demands
           # one even with --endpoint-url pointed at R2 (which ignores the
           # value but the CLI errors out client-side without it).
           AWS_DEFAULT_REGION: auto
           AWS_REGION: auto
-          ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
+          ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
         run: |
           newest() { aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
-            --bucket feedling-pg-backups --prefix "$1" \
+            --bucket io-in-enclave-db --prefix "$1" \
             --query 'sort_by(Contents,&LastModified)[-1].LastModified' --output text; }
-          WAL_TS=$(newest "wal-g/wal_005/")
-          BASE_TS=$(newest "wal-g/basebackups_005/")
+          WAL_TS=$(newest "prod/wal-g/wal_005/")
+          BASE_TS=$(newest "prod/wal-g/basebackups_005/")
           echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"
 
           check_age() {

@@ -1,0 +1,125 @@
+---
+title: Reliability and request behavior
+description: Pagination, limits, timeouts, retries, and idempotency rules for Feedling clients.
+---
+
+Feedling does not have one global pagination, rate-limit, timeout, or idempotency
+contract. Apply the operation-specific schema in the API reference. The rules
+below describe the public behavior that clients can safely share.
+
+## Pagination
+
+There is no universal opaque cursor. Timestamp formats and ordering differ by
+resource.
+
+| Endpoint family | Parameters | Ordering and continuation |
+| --- | --- | --- |
+| `GET /v1/chat/history` | `limit` 1–200, `since` Unix seconds, `before` Unix seconds | No cursor returns the latest page. `before` walks older messages. `since` walks forward. Use `oldest_ts`, `latest_ts`, `has_more_older`, and `has_more_newer` from the response. |
+| `GET /v1/memory/list` | `limit` up to 200, `since` ISO-8601 | Newest `occurred_at` first. The implementation keeps records whose `occurred_at >= since`, so de-duplicate by memory ID at page boundaries. `total` is the filtered count before slicing. |
+| `GET /v1/perception/photos` and `/items/{kind}` | `limit` 1–200, default 20 | Returns the most recent items. These endpoints do not currently return a continuation cursor. |
+| Event and receipt streams | Usually `since` plus `limit` | `since` is endpoint-specific; inspect the operation contract before assuming Unix time or ISO-8601. |
+
+For Chat, do not send `before` and `since` together. The server gives `before`
+precedence. A robust older-page loop is:
+
+1. Request the latest page without a cursor.
+2. Render and de-duplicate by `message.id`.
+3. While `has_more_older` is true, request `before=<oldest_ts>`.
+4. Stop if the returned page is empty or its `oldest_ts` does not advance.
+
+For forward Chat synchronization, persist `latest_ts` only after the page has
+been processed. Request `since=<latest_ts>` and continue while
+`has_more_newer` is true. IDs, not timestamps, are the final de-duplication key.
+
+## Rate limits and capacity responses
+
+The public API does not currently publish one account-wide request quota, and it
+does not guarantee standard rate-limit headers on every response. Do not hardcode
+a requests-per-minute value that is absent from the endpoint documentation.
+
+`429` is endpoint-specific. For example, Memory reflection creation can use it
+for a relationship-age business cap; retrying that response seconds later will
+not help. A provider-backed operation can also surface upstream capacity
+pressure. Inspect the response `error` and `detail` before classifying a `429` as
+transient.
+
+When `Retry-After` is present, honor it. When it is absent and the error is
+clearly temporary, use exponential backoff with full jitter. A reasonable client
+starting sequence is approximately 1, 2, 4, 8, then 16 seconds, randomized from
+zero to the current cap. This is client guidance, not a server SLA.
+
+## Timeouts and long polling
+
+Both Chat and proactive job polls accept a `timeout` in seconds, default to 30,
+and cap it at 60. A long poll that reaches that timeout normally returns `200`
+with an empty collection and `timed_out: true`. Start the next poll; do not log
+that response as an outage.
+
+Hosted Chat waits briefly for a runtime response but still returns `202` whether
+the assistant message is ready or not. The current server-side wait window is
+about eight seconds; it is an implementation detail, not a latency commitment.
+
+Suggested client timeout starting points:
+
+| Request type | Client timeout |
+| --- | --- |
+| TCP/TLS connect | 10 seconds |
+| Ordinary JSON operation | 30 seconds |
+| Hosted Chat send | At least 20 seconds |
+| Long poll | Requested `timeout` plus at least 10 seconds for network overhead |
+| Large upload | Size- and network-aware; do not reuse the ordinary JSON timeout blindly |
+
+These values are defensive defaults, not availability or latency guarantees.
+Applications should make them configurable for self-hosted deployments.
+
+## Retry safety
+
+Classify by operation semantics, not only by HTTP method. In particular,
+`GET /v1/perception/app_open` records an event and is not read-only.
+
+| Situation | Safe default |
+| --- | --- |
+| A read-only `GET` or `HEAD` fails before a response | Retry with bounded backoff. |
+| A long poll returns `timed_out: true` | Poll again immediately. |
+| `429` or `503` on a read | Honor `Retry-After` if present; otherwise retry only when the error is documented as temporary. |
+| A mutating request fails before any bytes are sent | It can be retried if the HTTP library can prove that condition. |
+| A mutating request times out after transmission | Treat the result as unknown. Read current state or reconcile by a stable resource ID before retrying. |
+| `409` | Resolve the represented state conflict; do not retry unchanged. |
+| `400`, `401`, `403`, or `404` | Fix the request, credential, permission, or resource reference first. |
+
+Cap retry attempts and total elapsed time. Preserve the same logical operation ID
+in client logs, but never log credentials or encrypted body material. Retain a
+server `request_id` when present.
+
+## Idempotency
+
+Feedling does not currently implement a service-wide `Idempotency-Key` header.
+Sending one does not make a write idempotent unless an individual operation says
+otherwise.
+
+Common consequences:
+
+- Retrying `/v1/chat/message`, `/v1/chat/response`, `/v1/memory/add`, a
+  Perception collection upload, or `app_open` can create duplicate effects.
+- A client-generated envelope or memory ID helps reconciliation but is not a
+  documented create-if-absent guarantee.
+- `POST /v1/model_api/chat/send` can be ambiguous after a client timeout. Search
+  Chat history for the submitted turn before sending it again.
+- Repeating a one-time link-token claim returns a conflict rather than the raw
+  API key again.
+- Repeating a delete can return `404` after the first request succeeded.
+- Account reset invalidates the credential used to call it. A lost success
+  response followed by `401` requires state-aware handling, not an automatic
+  second reset.
+
+Where exactly-once user experience matters, assign a client operation ID in your
+own state, persist it before the call, then reconcile against the resulting
+resource stream. Do not represent this as server-enforced exactly-once delivery.
+
+## Payload and response evolution
+
+Enforce documented request limits before encoding base64; base64 increases wire
+size. Unknown response fields must be ignored so additive API changes do not
+break clients. Do not depend on object key order or human-readable error text.
+See [versioning and deprecation](/docs/versioning) for the current compatibility
+policy.

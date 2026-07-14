@@ -20,8 +20,8 @@ E2E focus:
 on THROWAWAY users: each backend deletes its own freshly-seeded user and both
 must purge the same per-user tables.
 
-These routes gate on ``auth.require_user()`` only (no ``authorize_scope``), so
-there is no scope-failure (403) case — the ASGI router carries no ``require_scope``.
+Ordinary content routes accept either authenticated credential. Account reset
+is API-key-only so a hosted runtime cannot delete the account or all keys.
 """
 
 from __future__ import annotations

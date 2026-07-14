@@ -93,12 +93,36 @@ def _purge_onboarding_archives_with_retry(user_id: str) -> Exception | None:
 # --------------------------------------------------------------------------- #
 
 def _has_encrypted_content_record(item: dict | None) -> bool:
+    """Is this record encrypted content that key rotation must account for?
+
+    ``body_key`` counts exactly like an inline ``body_ct``: a chat row whose heavy
+    body was offloaded to object storage (db.chat_append) keeps its nonce/K_user/
+    K_enclave and swaps ``body_ct`` for a pointer. Reading only ``body_ct`` here
+    would call such a row "unencrypted" — which is not a harmless miscount. It
+    would let the rotation guard wave a key change through with no rewrap, and let
+    rewrap skip the record while still reporting a clean run, stranding that body
+    under a retired K_user permanently."""
     return bool(
         isinstance(item, dict)
-        and item.get("body_ct")
+        and (item.get("body_ct") or item.get("body_key"))
         and item.get("nonce")
         and item.get("K_user")
     )
+
+
+def _chat_records_with_bodies(store: UserStore) -> list[dict]:
+    """``store.chat_messages`` with any object-storage body pulled back inline.
+
+    ``chat_load`` deliberately hands back heavy rows as slim pointers, so the poll/
+    history hot paths never drag every historical body along. Content management is
+    the opposite case: export ships the ciphertext verbatim to the client, and
+    rewrap must DECRYPT it. Both need the real body, so resolve the pointers here.
+
+    Returns copies — the caller must not write these back into the store (the
+    cached rows stay slim)."""
+    with store.chat_lock:
+        msgs = [dict(m) for m in store.chat_messages if isinstance(m, dict)]
+    return [db.hydrate_chat_file_body(store.user_id, m) for m in msgs]
 
 
 def _encrypted_content_counts(store: UserStore) -> dict:
@@ -604,8 +628,9 @@ def rewrap_to_current_key(
         if env is not None:
             memory_plans.append((item_id, env))
 
-    with store.chat_lock:
-        chat_msgs = list(store.chat_messages)
+    # Bodies must be real here, not pointers — _build_rewrapped_envelope decrypts
+    # them through the enclave to re-wrap under the current key.
+    chat_msgs = _chat_records_with_bodies(store)
     for msg in chat_msgs:
         if not isinstance(msg, dict):
             continue
@@ -762,8 +787,11 @@ def export_data(store: UserStore) -> ExportResult:
     """
     # Synthetic verify-loop liveness rows are internal probes, not the user's
     # conversation — exclude them from the data export (belt-and-suspenders with
-    # the visible-history scrub).
-    hist = [m for m in store.chat_messages if m.get("source") != "verify_ping"]
+    # the visible-history scrub). Offloaded bodies are resolved back to ciphertext
+    # so an export is complete — the same reason frames go through db.frame_get
+    # below rather than being read straight off the index.
+    hist = [m for m in _chat_records_with_bodies(store)
+            if m.get("source") != "verify_ping"]
     moments = memory_service._load_moments(store)
     identity = identity_service._load_identity(store)
 

@@ -101,6 +101,20 @@ async def v1_identity_get(request: Request):
                 "visibility": identity.get("visibility", "shared"),
                 "decrypt_status": "ok",
             })
+            # Persona/voice fields: forward only when present and non-empty so the
+            # response shape stays additive (no empty keys added for older cards
+            # that predate these fields). These feed the resident consumer's
+            # partial-update "existing card" merge (RESIDENT_IDENTITY_FIELDS) —
+            # dropping them here silently loses tone_style/agent_role/do_not_say/
+            # boundaries on the next partial update.
+            if inner.get("tone_style"):
+                base["tone_style"] = inner.get("tone_style")
+            if inner.get("agent_role"):
+                base["agent_role"] = inner.get("agent_role")
+            if inner.get("do_not_say"):
+                base["do_not_say"] = inner.get("do_not_say")
+            if inner.get("boundaries"):
+                base["boundaries"] = inner.get("boundaries")
             return {"identity": base, "user_id": user_id}
         except (envelope.DecryptFailure, json.JSONDecodeError) as e:
             reason = e.reason if isinstance(e, envelope.DecryptFailure) else f"json: {e}"

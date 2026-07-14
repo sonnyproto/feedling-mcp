@@ -1,9 +1,46 @@
 import base64
 import secrets
+import sys
+from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from tools.provider_smoke import crypto
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "backend"))
+import content_encryption as ce  # noqa: E402 — the authoritative implementation
+
+
+# ---- drift guards: mirror vs the REAL implementation ----
+#
+# Everything below this comment used to be tested only against itself (mirror seals,
+# mirror opens), which is why a real drift went unnoticed: crypto.py still carried the
+# OLD BoxSeal scheme (HKDF salt=ek_pub||recipient + zero nonce) long after the server
+# moved to salt=None + nonce=SHA256(ek_pub||recipient_pk)[:12]. Self-consistent tests
+# stayed green while `run_smoke <any provider>` died on a bare `InvalidTag` for every
+# reply — the tool was 100% broken and nothing caught it.
+#
+# The only assertion that means anything: WHAT THE SERVER SEALS, THIS MIRROR MUST OPEN.
+
+
+def test_mirror_opens_what_the_server_seals():
+    sk, pk = crypto.generate_keypair()
+    blob = ce.box_seal(b"sealed by the server", pk)
+    assert crypto.box_open(blob, sk, pk) == b"sealed by the server"
+
+
+def test_mirror_decrypts_a_real_server_envelope():
+    """The exact path the smoke client walks: the server builds the v1 envelope
+    (K_user wrap + body AEAD bound by the owner|v|id AAD); we must recover it."""
+    sk, pk = crypto.generate_keypair()
+    _, enclave_pk = crypto.generate_keypair()
+    env = ce.build_envelope(
+        plaintext="回复内容".encode(),
+        owner_user_id="usr_test",
+        user_pk_bytes=pk,
+        enclave_pk_bytes=enclave_pk,
+    )
+    assert crypto.decrypt_reply(env, sk, pk) == "回复内容"
 
 
 def test_box_seal_open_roundtrip():

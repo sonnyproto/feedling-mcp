@@ -31,7 +31,9 @@ import json
 import logging
 import os
 import threading
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -519,6 +521,24 @@ def record_tee_sync_run(summary: dict) -> None:
         log.error("[db] record_tee_sync_run failed: %s", e)
 
 
+def last_tee_reconcile_age_sec() -> float | None:
+    """Seconds since the most recent SUCCESSFUL reconcile tick, or None if there
+    has never been one. Read by the tee-sync scheduler at loop start so a new
+    leader (gunicorn worker recycling hands leadership over) does not restart
+    from ``last_reconcile=None`` and redo reconcile-first — a full reconcile
+    takes tens of minutes, so with short worker lifetimes it would never finish
+    (2026-07-14 test: 2h of leader churn, zero completed ticks). Age is computed
+    server-side (``now() - max(ran_at)``) so client clock skew is irrelevant."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT EXTRACT(EPOCH FROM (now() - max(ran_at))) FROM tee_sync_runs "
+            "WHERE did_reconcile AND reconcile_ok IS TRUE"
+        ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
+
+
 def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     """Most-recent TEE sync summaries, newest first (observability endpoint).
     ``ran_at`` is ISO-8601; ``report`` is the parsed JSONB detail dict."""
@@ -884,8 +904,32 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def _dau_row(row) -> dict:
+    return {
+        "day": row[0],
+        "dau": int(row[1] or 0),
+        "chat_dau": int(row[2] or 0),
+        "tracking_dau": int(row[3] or 0),
+        "active_events": int(row[4] or 0),
+        "user_messages": int(row[5] or 0),
+        "tracking_events": int(row[6] or 0),
+        "first_ts": row[7],
+        "last_ts": row[8],
+        "avg_session_sec": float(row[9] or 0),
+        "foreground_sec": int(row[10] or 0),
+        "session_count": int(row[11] or 0),
+        "session_dau": int(row[12] or 0),
+        "frozen": bool(row[13]),
+    }
+
+
 def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
-    """Return metadata-only daily active user aggregates.
+    """Return daily active-user aggregates, preferring immutable snapshots.
+
+    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
+    before the snapshot boundary remain live. If ``since_epoch`` cuts through
+    a frozen day, that day also falls back to live data so the existing exact
+    timestamp-filter contract is preserved. Every row exposes ``frozen``.
 
     DAU is intentionally user-initiated activity only: user chat messages plus
     client tracking events. Agent replies, proactive writes, and synthetic
@@ -950,41 +994,194 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                         COUNT(DISTINCT user_id)::int AS session_dau
                     FROM usage_events
                     GROUP BY day
+                ),
+                live AS (
+                    SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
+                           d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
+                           COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
+                           COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                           COALESCE(u.session_count, 0)::int AS session_count,
+                           COALESCE(u.session_dau, 0)::int AS session_dau
+                    FROM daily d
+                    LEFT JOIN usage_daily u ON u.day = d.day
+                ),
+                frozen_rows AS (
+                    SELECT day, dau, chat_dau, tracking_dau, active_events,
+                           user_messages, tracking_events, first_ts, last_ts,
+                           avg_session_sec, foreground_sec, session_count, session_dau
+                    FROM dau_daily_snapshot
+                    WHERE active_events > 0
+                      AND (%s = 0 OR first_ts >= %s)
+                ),
+                merged AS (
+                    SELECT f.*, TRUE AS frozen FROM frozen_rows f
+                    UNION ALL
+                    SELECT l.*, FALSE AS frozen
+                    FROM live l
+                    WHERE NOT EXISTS (SELECT 1 FROM frozen_rows f WHERE f.day = l.day)
                 )
-                SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
-                       d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
-                       COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
-                       COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
-                       COALESCE(u.session_count, 0)::int AS session_count,
-                       COALESCE(u.session_dau, 0)::int AS session_dau
-                FROM daily d
-                LEFT JOIN usage_daily u ON u.day = d.day
-                ORDER BY d.day DESC
+                SELECT day, dau, chat_dau, tracking_dau, active_events,
+                       user_messages, tracking_events, first_ts, last_ts,
+                       avg_session_sec, foreground_sec, session_count, session_dau,
+                       frozen
+                FROM merged
+                ORDER BY day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, since, since, tz, tz, day_limit),
+                (since, since, since, since, since, since, tz, tz, since, since, day_limit),
             ).fetchall()
-        return [
-            {
-                "day": row[0],
-                "dau": row[1],
-                "chat_dau": row[2],
-                "tracking_dau": row[3],
-                "active_events": row[4],
-                "user_messages": row[5],
-                "tracking_events": row[6],
-                "first_ts": row[7],
-                "last_ts": row[8],
-                "avg_session_sec": float(row[9] or 0),
-                "foreground_sec": int(row[10] or 0),
-                "session_count": int(row[11] or 0),
-                "session_dau": int(row[12] or 0),
-            }
-            for row in rows
-        ]
+        return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
         return []
+
+
+def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
+    zone = ZoneInfo(tz)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    row = conn.execute(
+        """
+        WITH active AS (
+            SELECT user_id, ts, 'chat' AS source
+            FROM chat_messages
+            WHERE doc->>'role' = 'user'
+              AND COALESCE(doc->>'source', '') <> 'verify_ping'
+              AND ts >= %s AND ts < %s
+
+            UNION ALL
+
+            SELECT user_id, ts, 'tracking' AS source
+            FROM user_logs
+            WHERE stream = 'tracking_events'
+              AND ts IS NOT NULL
+              AND ts >= %s AND ts < %s
+        ),
+        usage_events AS (
+            SELECT
+                user_id,
+                CASE
+                  WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                  THEN (doc->'payload'->>'duration_sec')::bigint
+                  ELSE 0
+                END AS duration_sec
+            FROM user_logs
+            WHERE stream = 'tracking_events'
+              AND doc->>'type' = 'app_session_end'
+              AND ts IS NOT NULL
+              AND ts >= %s AND ts < %s
+        )
+        SELECT
+            COUNT(DISTINCT user_id)::int AS dau,
+            (COUNT(DISTINCT user_id) FILTER (WHERE source = 'chat'))::int AS chat_dau,
+            (COUNT(DISTINCT user_id) FILTER (WHERE source = 'tracking'))::int AS tracking_dau,
+            COUNT(*)::int AS active_events,
+            (COUNT(*) FILTER (WHERE source = 'chat'))::int AS user_messages,
+            (COUNT(*) FILTER (WHERE source = 'tracking'))::int AS tracking_events,
+            MIN(ts) AS first_ts,
+            MAX(ts) AS last_ts,
+            COALESCE((SELECT AVG(duration_sec) FROM usage_events), 0)::double precision,
+            COALESCE((SELECT SUM(duration_sec) FROM usage_events), 0)::bigint,
+            (SELECT COUNT(*)::int FROM usage_events),
+            (SELECT COUNT(DISTINCT user_id)::int FROM usage_events)
+        FROM active
+        """,
+        (start, end, start, end, start, end),
+    ).fetchone()
+    return {
+        "day": day.isoformat(),
+        "dau": int(row[0] or 0),
+        "chat_dau": int(row[1] or 0),
+        "tracking_dau": int(row[2] or 0),
+        "active_events": int(row[3] or 0),
+        "user_messages": int(row[4] or 0),
+        "tracking_events": int(row[5] or 0),
+        "first_ts": row[6],
+        "last_ts": row[7],
+        "avg_session_sec": float(row[8] or 0),
+        "foreground_sec": int(row[9] or 0),
+        "session_count": int(row[10] or 0),
+        "session_dau": int(row[11] or 0),
+    }
+
+
+def freeze_completed_dau_days(*, now_epoch: float | None = None,
+                              tz: str = "Asia/Shanghai") -> list[str]:
+    """Insert immutable snapshots for completed Beijing days.
+
+    The first successful run freezes yesterday only, establishing the rollout
+    boundary without pretending older, already-understated history is exact.
+    Later runs fill every missing day from that boundary through yesterday.
+    Zero-activity rows are stored to preserve the boundary but omitted from the
+    DAU read API. ``ON CONFLICT DO NOTHING`` makes concurrent ticks write-once.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = datetime.fromtimestamp(float(now_epoch), zone) if now_epoch is not None else datetime.now(zone)
+        last_completed = now.date() - timedelta(days=1)
+        with get_pool().connection() as conn:
+            row = conn.execute("SELECT MIN(day) FROM dau_daily_snapshot").fetchone()
+            first_day = date.fromisoformat(row[0]) if row and row[0] else last_completed
+            if first_day > last_completed:
+                return []
+            existing = {
+                date.fromisoformat(r[0])
+                for r in conn.execute(
+                    "SELECT day FROM dau_daily_snapshot WHERE day >= %s AND day <= %s",
+                    (first_day.isoformat(), last_completed.isoformat()),
+                ).fetchall()
+            }
+            inserted: list[str] = []
+            cursor = first_day
+            while cursor <= last_completed:
+                if cursor not in existing:
+                    snap = _completed_dau_row(conn, day=cursor, tz=tz)
+                    saved = conn.execute(
+                        """
+                        INSERT INTO dau_daily_snapshot (
+                            day, dau, chat_dau, tracking_dau, active_events,
+                            user_messages, tracking_events, session_dau,
+                            avg_session_sec, foreground_sec, session_count,
+                            first_ts, last_ts
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (day) DO NOTHING
+                        RETURNING day
+                        """,
+                        (
+                            snap["day"], snap["dau"], snap["chat_dau"],
+                            snap["tracking_dau"], snap["active_events"],
+                            snap["user_messages"], snap["tracking_events"],
+                            snap["session_dau"], snap["avg_session_sec"],
+                            snap["foreground_sec"], snap["session_count"],
+                            snap["first_ts"], snap["last_ts"],
+                        ),
+                    ).fetchone()
+                    if saved:
+                        inserted.append(saved[0])
+                cursor += timedelta(days=1)
+        return inserted
+    except Exception as e:
+        log.error("[db] freeze_completed_dau_days failed: %s", e)
+        return []
+
+
+def admin_dau_snapshot_bounds() -> dict:
+    """Return the immutable snapshot range for admin rendering."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(day), MAX(day), COUNT(*) FROM dau_daily_snapshot"
+            ).fetchone()
+        return {
+            "first_day": row[0] or "",
+            "last_day": row[1] or "",
+            "days": int(row[2] or 0),
+        }
+    except Exception as e:
+        log.error("[db] admin_dau_snapshot_bounds failed: %s", e)
+        return {"first_day": "", "last_day": "", "days": 0}
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -1462,8 +1659,9 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
     fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic → claude；openai → codex (native)；其余 fit provider
-    （deepseek/gemini/openrouter/openai_compatible）→ pi。
+    anthropic/deepseek → claude（deepseek 走其 /anthropic 兼容层，Anthropic wire）；
+    openai → codex (native)；其余 fit provider
+    （gemini/openrouter/openai_compatible）→ pi。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
@@ -1479,6 +1677,7 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
+                    WHEN 'deepseek'  THEN 'claude'
                     WHEN 'openai'    THEN 'codex'
                     ELSE 'pi'
                   END AS driver,
@@ -2306,6 +2505,14 @@ def chat_load(user_id: str) -> list[dict]:
         return []
 
 
+# Content types whose body_ct is heavy enough to live in R2 rather than inline in
+# the chat_messages row. Images join files here: a single photo's ciphertext runs
+# 1-2MB, which TOASTs the row and is then carried through every WAL record, WAL-G
+# backup, and TEE mirror/re-encrypt pass. The read side is content-type agnostic
+# (a pointer is anything with body_key), so adding a type here is write-side only.
+_R2_OFFLOAD_CONTENT_TYPES = ("file", "image")
+
+
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 
@@ -2320,10 +2527,14 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
 
     Call this ONLY at exits that actually deliver a body (poll delivery, a
     history page that includes the body, single message-body fetch) — never in
-    bulk load — so a leaked/large file is fetched once, on demand."""
+    bulk load — so a leaked/large file is fetched once, on demand.
+
+    The fetch uses the row's OWN ``body_key`` rather than recomputing one, so a
+    row written under an older key layout still resolves. The key is data, though,
+    so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
-    body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
+    body = object_storage.get_chat_body(str(doc.get("body_key") or ""), user_id)
     if body is None:
         return doc
     out = {k: v for k, v in doc.items() if k != "body_key"}
@@ -2335,18 +2546,18 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
     """Insert one chat message then trim to the newest ``max_messages`` rows,
     mirroring the in-memory ring buffer. Idempotent on msg_id.
 
-    A heavy ``content_type="file"`` body_ct is offloaded to R2 when configured
-    (``object_storage.chat_files_enabled()``); the row then keeps only the
-    envelope metadata plus a ``body_key`` pointer, and ``chat_load`` reconstitutes
-    ``body_ct`` from R2 transparently. Falls back to inline storage when R2 is
-    unconfigured OR the upload fails. Crash-safe, same ordering as frame_upsert:
-    the row is written inline (readable, no pointer) BEFORE the object exists and
-    flipped to the pointer shape only AFTER the upload succeeds — a crash never
-    leaves a pointer to a missing object."""
+    A heavy body_ct (``_R2_OFFLOAD_CONTENT_TYPES``: file, image) is offloaded to
+    R2 when configured (``object_storage.chat_files_enabled()``); the row then
+    keeps only the envelope metadata plus a ``body_key`` pointer, and
+    ``chat_load`` reconstitutes ``body_ct`` from R2 transparently. Falls back to
+    inline storage when R2 is unconfigured OR the upload fails. Crash-safe, same
+    ordering as frame_upsert: the row is written inline (readable, no pointer)
+    BEFORE the object exists and flipped to the pointer shape only AFTER the
+    upload succeeds — a crash never leaves a pointer to a missing object."""
     offload = (
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
-        and doc.get("content_type") == "file"
+        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
         and doc.get("body_ct") is not None
     )
     trimmed_docs: list = []
@@ -2377,17 +2588,18 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
             # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
             try:
                 body_ct_len = len(doc["body_ct"])
-                object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
+                # The key comes back from the upload rather than being recomputed —
+                # the row can then never point somewhere the object isn't.
+                key = object_storage.put_chat_body(
+                    user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
+                )
                 # 3) object exists → flip the row to the pointer shape as the last
                 #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
                 #    drop only body_ct and add the pointer keys, so any reply/claim
                 #    metadata another worker merged into `doc` during the upload is
                 #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
                 #    was already flipped (idempotent, avoids a double-flip race).
-                pointer = {
-                    "body_key": object_storage.chat_file_key(user_id, msg_id),
-                    "body_ct_len": body_ct_len,
-                }
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
                 with get_pool().connection() as conn:
                     conn.execute(
                         "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
@@ -2397,11 +2609,13 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
             except Exception as e:  # noqa: BLE001
                 log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
                           user_id, msg_id, e)
-        # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
+        # Best-effort: drop R2 objects for any offloaded rows just trimmed. Driven by
+        # the row's own body_key (not content_type, not a recomputed key) — a pointer
+        # row always has exactly one object to reclaim, whatever type/layout wrote it.
         if trimmed_docs and object_storage.chat_files_enabled():
             for d in trimmed_docs:
-                if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
-                    object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
+                if isinstance(d, dict) and d.get("body_key"):
+                    object_storage.delete_chat_body(str(d["body_key"]), user_id)
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
         return
@@ -2563,15 +2777,15 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
     ])
     if row is None:
         return False
-    # Drop the offloaded R2 body if this was a file message.
+    # Drop the offloaded R2 body if this row was a pointer. Driven by the row's own
+    # body_key — see the trim path in chat_append.
     doc = row[0]
     if (
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
         and doc.get("body_key")
-        and doc.get("content_type") == "file"
     ):
-        object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
+        object_storage.delete_chat_body(str(doc["body_key"]), user_id)
     return True
 
 

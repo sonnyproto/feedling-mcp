@@ -268,25 +268,23 @@ def _reflection_time_cap_ok(moments: list, days: int) -> tuple:
 def _per_tab_floors_for_days(days: int) -> dict:
     """Per-tab memory floors by relationship age. Returns
     {story, about_me, ta_thinking, total}. The total isn't a sum of the
-    three (some over-shooting on About me shouldn't compensate for an
-    empty Story); it's the bootstrap-gate threshold that subsumes them.
+    three; it is the v2 consistency signal surfaced in bootstrap/status.
 
-    Tiers (post-2026-05-22):
-      ≥ 6 months: 15 / 60 / 12   (total 87)  — established, deep substrate
-      ≥ 1 month:   8 / 25 /  5   (total 38)  — real history
-      ≥ 2 days:    3 /  8 /  2   (total 13)  — recent but real
+    Tiers (post-2026-07-14 Seven calibration):
+      ≥ 6 months:  5 / 20 /  5   (total 30)  — established, deep substrate
+      ≥ 1 month:   2 /  8 /  2   (total 12)  — real history
+      ≥ 2 days:    1 /  3 /  1   (total  5)  — recent but real
       < 2 days:    1 /  1 /  0   (total  2)  — we-just-met
 
-    Per-tab floors drive identity_init gate (Story + About me floors are
-    hard prerequisites; TA 在想 is encouraged but not blocking because
-    reflections require substrate from the other two tabs first).
+    Per-tab floors are display/diagnostic only. Memory quantity must never
+    gate onboarding or chat; it only flags possible under-distillation.
     """
     if days >= 180:
-        return {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87}
+        return {"story":  5, "about_me": 20, "ta_thinking":  5, "total": 30}
     if days >= 30:
-        return {"story":  8, "about_me": 25, "ta_thinking":  5, "total": 38}
+        return {"story":  2, "about_me":  8, "ta_thinking":  2, "total": 12}
     if days >= 2:
-        return {"story":  3, "about_me":  8, "ta_thinking":  2, "total": 13}
+        return {"story":  1, "about_me":  3, "ta_thinking":  1, "total":  5}
     return     {"story":  1, "about_me":  1, "ta_thinking":  0, "total":  2}
 
 
@@ -297,3 +295,23 @@ def _memory_floor_for_days(days: int) -> int:
     history (was a hard onboarding gate, now decoupled from gating).
     """
     return int(_per_tab_floors_for_days(days).get("total", 0))
+
+
+def _memory_aspiration_for_days(days: int) -> int:
+    """Wide upper reference for resident distillation density.
+
+    Like the floor, this is a consistency signal only. It gives the VPS resident
+    a target range while preserving the non-fiction rule: sparse material should
+    still produce fewer cards, never invented filler.
+    """
+    try:
+        d = int(days or 0)
+    except Exception:
+        d = 0
+    if d >= 180:
+        return 70
+    if d >= 30:
+        return 35
+    if d >= 2:
+        return 15
+    return 4

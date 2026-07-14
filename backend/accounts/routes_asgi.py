@@ -15,7 +15,7 @@ from accounts import accounts_core, whoami_core
 from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
-from asgi.deps import require_auth
+from asgi.deps import require_api_key, require_auth
 
 router = APIRouter()
 
@@ -47,7 +47,8 @@ async def access_modes_switch(request: Request, auth: AuthResult = Depends(requi
 
 
 @router.post("/v1/access/link-token")
-async def access_link_token_create(request: Request, auth: AuthResult = Depends(require_auth)):
+async def access_link_token_create(request: Request, auth: AuthResult = Depends(require_api_key)):
+    # A runtime token must never be exchangeable for a new long-lived API key.
     payload = (await asgi_http.read_json_silent(request)) or {}
     body, status = await threadpool.run_db(accounts_core.access_link_token_create, auth.store, payload)
     return JSONResponse(body, status_code=status)

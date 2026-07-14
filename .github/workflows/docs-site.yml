@@ -1,0 +1,71 @@
+name: Docs site
+
+on:
+  push:
+    branches: [main, test]
+    paths:
+      - 'backend/**'
+      - 'docs-site/**'
+      - 'tools/export_public_openapi.py'
+      - 'tools/public_openapi_contracts.py'
+      - '.github/workflows/docs-site.yml'
+  pull_request:
+    branches: [main, test]
+    paths:
+      - 'backend/**'
+      - 'docs-site/**'
+      - 'tools/export_public_openapi.py'
+      - 'tools/public_openapi_contracts.py'
+      - '.github/workflows/docs-site.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+
+      - name: Install backend dependencies
+        run: python -m pip install --require-hashes -r backend/requirements.lock
+
+      - name: Verify public OpenAPI snapshot
+        env:
+          FEEDLING_DATA_DIR: /tmp/feedling-openapi
+        run: |
+          python tools/export_public_openapi.py --output /tmp/feedling-public-openapi.json
+          diff -u docs-site/openapi/public.json /tmp/feedling-public-openapi.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install documentation dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: Type-check
+        working-directory: docs-site
+        run: npm run types:check
+
+      - name: Lint
+        working-directory: docs-site
+        run: npm run lint
+
+      - name: Build static site
+        working-directory: docs-site
+        run: npm run build

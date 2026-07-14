@@ -6,7 +6,8 @@
 游标编码（游标表只有 watermark_ts DOUBLE + watermark_id TEXT 两列）：
   - chat：sort=ts（DOUBLE）→ watermark_ts=ts，watermark_id=msg_id；``(ts,msg_id)`` 键集。
   - memory/world_book：sort=occurred_at/updated_at（TEXT）→ watermark_ts=0，
-    watermark_id=``"{sort}\\x00{id}"`` 复合（NUL 分隔，ISO 时间戳与 hex id 均不含 NUL）。
+    watermark_id=``"{sort}\\x1f{id}"`` 复合（\x1f 分隔——见 _SEP，绝不用 NUL:TEXT 列
+    不接受 NUL）。sort_val=ISO 时间戳不含 \x1f，partition 取首个分隔符即可无歧义解码。
   - identity：单列 user_id 游标（user_blobs kind=identity 一行/用户）。
 
 只覆盖「向前追加」——memory/world_book 的原地改写（back-dated / rewrap 戳 / visibility
@@ -36,7 +37,12 @@ log = logging.getLogger("feedling.tee_replicator")
 
 BATCH = 500
 _RETRIES = 2                 # 单行 decrypt 额外重试次数（共 1+2=3 次尝试）
-_NUL = "\x00"                # 文本复合游标分隔符
+_SEP = "\x1f"                # 文本复合游标分隔符（ASCII Unit Separator）。
+# 绝不能用 NUL(\x00):watermark_id 是 PostgreSQL TEXT 列，TEXT 不接受 NUL(0x00)，
+# 写含 NUL 的游标会抛 "text fields cannot contain NUL"、整表复制崩(2026-07-14 prod
+# 实测:memory_moments/world_book_entries 一有数据就撞;test 因这两表无数据从未暴露)。
+# \x1f 是非 NUL 控制字符、TEXT 可存、且绝不出现在 sort_val(ISO 时间戳)里 → partition
+# 取首个分隔符即可无歧义解码。历史上从未成功写过含 NUL 的复合游标，故换分隔符零迁移负担。
 # runtime token 铸 900s TTL；缓存条目超过 600s 就重铸（留足余量——长跑 pass 在
 # qps=2 × BATCH=500 下每批 sleep ~250s，第 2-3 批就会越过 900s TTL）。
 _TOKEN_MAX_AGE = 600.0
@@ -419,7 +425,7 @@ def _encode_cursor(cfg: _Table, sort_val, item_id: str) -> tuple[float, str]:
         return (float(sort_val or 0.0), str(item_id))
     if cfg.cursor_kind == "single":
         return (0.0, str(sort_val or ""))
-    return (0.0, f"{sort_val or ''}{_NUL}{item_id}")
+    return (0.0, f"{sort_val or ''}{_SEP}{item_id}")
 
 
 def _decode_cursor(cfg: _Table, wm_ts: float, wm_id: str) -> tuple:
@@ -428,7 +434,7 @@ def _decode_cursor(cfg: _Table, wm_ts: float, wm_id: str) -> tuple:
         return (wm_ts, wm_id)
     if cfg.cursor_kind == "single":
         return (wm_id,)
-    sort_val, _, item_id = wm_id.partition(_NUL)
+    sort_val, _, item_id = wm_id.partition(_SEP)
     return (sort_val, item_id)
 
 

@@ -16,6 +16,16 @@ from admin import tee_sync_scheduler as sched  # noqa: E402
 from admin import tee_replication as tr  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clear_table_backoff():
+    """`sched._table_backoff` 是模块级状态（生产上 worker 级正确；测试间必须归零）。
+    别的测试文件（如 test_tee_sync_metrics 走过失败路径的 _sync_tick）留下的退避
+    条目会让这里的「每 tick 全表 replicate」断言看到被跳过的表——反之亦然。"""
+    sched._table_backoff.clear()
+    yield
+    sched._table_backoff.clear()
+
+
 @pytest.fixture
 def calls(monkeypatch):
     recorded = []
@@ -143,3 +153,109 @@ def test_failed_reconcile_returns_false_for_soon_retry(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     # reconcile failed → False so _loop won't advance last_reconcile (retries next tick).
     assert sched._sync_tick(do_reconcile=True) is False
+
+
+def test_first_tick_always_reconciles_regardless_of_monotonic(monkeypatch):
+    """首个 tick(last_reconcile is None)必 reconcile —— 建立 users 基线,不能靠
+    monotonic() 的绝对值(宿主 uptime 小的新 CVM 上它 < reconcile 间隔 → 旧逻辑首 tick
+    不 reconcile → FK 全线失败,2026-07-14 prod 实测)。"""
+    monkeypatch.setenv("FEEDLING_TEE_RECONCILE_INTERVAL_SEC", "86400")
+    # 新进程:last_reconcile=None,monotonic 才几秒(远 < 86400)——旧逻辑会返回 False。
+    assert sched._should_reconcile(None, 5.0) is True
+    # 已 reconcile 过:未到间隔不重跑
+    assert sched._should_reconcile(1000.0, 1000.0 + 86399) is False
+    # 到间隔:重跑
+    assert sched._should_reconcile(1000.0, 1000.0 + 86400) is True
+
+
+# --------------------------------------------------------------------------- #
+# per-table 失败退避：整表 replicate 连败时指数退避，不再每 tick 无退避地重拉
+# 重解密同一段卡住的行（2026-07-14 prod 实测：两张 text-cursor 表连败让名义 300s
+# 的 tick 连轴转成 13-87 分钟，成为 backend 内存/CPU churn 主源之一）。
+# --------------------------------------------------------------------------- #
+
+def _fail_table_fake(recorded, failing_table):
+    def fake(*, action, table=None, dry_run=True, confirm=None, **kw):
+        recorded.append((action, table))
+        if action == "replicate" and table == failing_table:
+            raise RuntimeError("text fields cannot contain NUL")
+        return {"ok": True, "copied": 0, "pending": 0, "errors": 0}
+    return fake
+
+
+def test_failing_table_skipped_while_backing_off(monkeypatch):
+    recorded: list = []
+    monkeypatch.setattr(tr, "run_action", _fail_table_fake(recorded, "memory_moments"))
+
+    sched._sync_tick(do_reconcile=False)          # 第一败
+    recorded.clear()
+    sched._sync_tick(do_reconcile=False)          # 紧接着的下一 tick
+    tables = [t for a, t in recorded if a == "replicate"]
+    assert "memory_moments" not in tables          # 退避中 → 跳过
+    assert "chat_messages" in tables               # 其他表不受影响
+
+
+def test_backoff_expires_then_retries(monkeypatch):
+    recorded: list = []
+    monkeypatch.setattr(tr, "run_action", _fail_table_fake(recorded, "memory_moments"))
+
+    sched._sync_tick(do_reconcile=False)
+    # 手动把退避窗口拨到已过期
+    fails, _retry_at = sched._table_backoff["memory_moments"]
+    sched._table_backoff["memory_moments"] = (fails, 0.0)
+    recorded.clear()
+    sched._sync_tick(do_reconcile=False)
+    assert ("replicate", "memory_moments") in recorded  # 窗口过了 → 重试
+
+
+def test_backoff_resets_on_success(monkeypatch):
+    recorded: list = []
+    fail_once = {"n": 0}
+
+    def fake(*, action, table=None, dry_run=True, confirm=None, **kw):
+        recorded.append((action, table))
+        if action == "replicate" and table == "memory_moments" and fail_once["n"] == 0:
+            fail_once["n"] = 1
+            raise RuntimeError("transient")
+        return {"ok": True, "copied": 0, "pending": 0, "errors": 0}
+
+    monkeypatch.setattr(tr, "run_action", fake)
+    sched._sync_tick(do_reconcile=False)                      # 败一次 → 进退避
+    sched._table_backoff["memory_moments"] = (1, 0.0)         # 窗口拨到过期
+    sched._sync_tick(do_reconcile=False)                      # 重试成功
+    assert "memory_moments" not in sched._table_backoff        # 成功 → 清零
+
+
+def test_backoff_delay_doubles_and_caps(monkeypatch):
+    monkeypatch.setenv("FEEDLING_TEE_SYNC_INTERVAL_SEC", "300")
+    assert sched._backoff_delay(1) == 300.0
+    assert sched._backoff_delay(2) == 600.0
+    assert sched._backoff_delay(3) == 1200.0
+    assert sched._backoff_delay(10) == sched._BACKOFF_CAP_SEC
+
+
+# --------------------------------------------------------------------------- #
+# last_reconcile 必须跨 worker 存活：gunicorn max_requests 回收 leader worker 后,
+# 新 leader 若从 None 起步就会重做 reconcile-first——test 实测 reconcile ~40min >
+# worker 寿命 → reconcile 永远完不成、tee_sync_runs 零新行(2026-07-14 部署后 2h)。
+# 从 tee_sync_runs 恢复上次成功 reconcile 的时点(换算到本进程 monotonic 轴)。
+# --------------------------------------------------------------------------- #
+
+def test_restore_last_reconcile_from_db_age(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", lambda: 100.0)
+    restored = sched._restore_last_reconcile()
+    assert restored is not None
+    assert abs((_time.monotonic() - 100.0) - restored) < 5.0
+
+
+def test_restore_last_reconcile_none_when_no_history(monkeypatch):
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", lambda: None)
+    assert sched._restore_last_reconcile() is None
+
+
+def test_restore_last_reconcile_swallows_db_errors(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", boom)
+    assert sched._restore_last_reconcile() is None

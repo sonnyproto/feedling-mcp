@@ -327,8 +327,8 @@ def test_offloaded_file_row_hydrated_from_r2_then_replicated(backend_env, monkey
     _insert_chat_file_pointer(uid, "filemsg", 20.0)
 
     monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
-    monkeypatch.setattr(object_storage, "get_chat_file_body",
-                        lambda u, m: "FILECT" if (u, m) == (uid, "filemsg") else None)
+    monkeypatch.setattr(object_storage, "get_chat_body",
+                        lambda key, u: "FILECT" if key == f"chatfiles/{uid}/filemsg" else None)
 
     report = worker.run_table("chat_messages", qps=1000)
 
@@ -356,7 +356,7 @@ def test_offloaded_file_row_hydration_failure_freezes_cursor(backend_env, monkey
     _insert_chat(uid, "c", 30.0, "CCC")
 
     monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
-    monkeypatch.setattr(object_storage, "get_chat_file_body", lambda u, m: None)
+    monkeypatch.setattr(object_storage, "get_chat_body", lambda key, u: None)
 
     def _strict(_user_id):
         def decrypt(envelope, purpose):
@@ -409,3 +409,22 @@ def test_poison_row_skipped_not_wedging_table(backend_env, monkeypatch):
     # cursor advanced past the poison row (last row 'good2') → table not wedged
     cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
     assert cur[0][0] == "good2"
+
+
+def test_text_cursor_composite_has_no_nul_and_persists(backend_env):
+    """text-kind 表(memory/world_book)的复合游标 watermark_id 绝不能含 NUL——它写进
+    tee_replication_cursors 的 TEXT 列,而 PostgreSQL 的 TEXT 不接受 NUL(0x00)。
+    2026-07-14 prod 实测:这两表一有数据就撞 "text fields cannot contain NUL" 整表复制崩;
+    test 因这两表无源数据从未暴露。这里把编码出的复合游标真写进 TEE 游标表,证明:
+    (a) watermark_id 不含 NUL、(b) 写 TEXT 列不抛(prod 崩的正是这步)、(c) encode/decode 往返一致。"""
+    cfg = worker._TABLES["world_book_entries"]          # cursor_kind="text"
+    sort_val = "2026-07-14T03:38:16.123456+00:00"       # 真实 ISO 时间戳
+    item_id = "wb_0a1b2c3d4e5f6071"
+    wm_ts, wm_id = worker._encode_cursor(cfg, sort_val, item_id)
+    assert "\x00" not in wm_id                                              # 核心:无 NUL
+    assert worker._decode_cursor(cfg, wm_ts, wm_id) == (sort_val, item_id)  # 往返一致
+    # prod 崩在这一步:把含分隔符的复合游标写进 TEXT 列。现在必须不抛。
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as c:
+        c.execute(worker._CURSOR_UPSERT, ("world_book_entries", wm_ts, wm_id))
+    back = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='world_book_entries'")
+    assert back[0][0] == wm_id

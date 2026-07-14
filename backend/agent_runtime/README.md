@@ -66,17 +66,17 @@ the child so it isn't mistaken for alive).
 | Provider | Driver | Agent | Transport |
 |---|---|---|---|
 | `anthropic` | `claude` | claude CLI native | Anthropic Messages wire (V1) |
+| `deepseek` | `claude` | claude CLI | Anthropic Messages wire @ `ANTHROPIC_BASE_URL={base_url}/anthropic` |
 | `openai` | `codex` | codex exec native | OpenAI Responses wire |
 | `gemini` | `pi` | pi native relay | `google-generative-ai` @ OpenAI-compatible shim |
 | `openrouter` | `pi` | pi native relay | `openai-completions` @ `https://openrouter.ai/api/v1` |
 | `openai_compatible` | `pi` | pi native relay | `openai-completions` @ user's `base_url` |
-| `deepseek` | `pi` | pi native relay | `anthropic-messages` @ `{base_url}/anthropic` (text-only) |
 
 **Reasoning effort:** forwarded natively by the pi relay (no gateway intermediary). Provider support:
 - `anthropic` (claude): native
 - `openai` (codex): native Responses wire
 - `gemini`, `openrouter`, `openai_compatible` (pi): the model entry sets `reasoning: true` (pi's thinking switch — verified against pi-ai 0.80.3 `pi --list-models`; the earlier `reasoningEffort` field was ignored) and the resident passes the level via `--thinking <level>`. openrouter pins `compat.thinkingFormat="openrouter"`. Gated on the route's `reasoning_effort`; null stays off (`_PI_REASONING_DEFAULT`).
-- `deepseek` (pi): text-only, no reasoning (Anthropic-wire passthrough unverified).
+- `deepseek` (claude): thinking streamed via the thinking-claude command (`_claude_cli_should_stream_thinking`).
 
 ## Tests
 

@@ -654,6 +654,80 @@ def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
     assert calls == ["fact-write-0"]
 
 
+def test_memory_recheck_returns_only_missing_memories():
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            payload = json.loads(kwargs["messages"][1]["content"])
+            assert "用户养了一只叫蛋子的狗" in payload["original_material"]
+            assert payload["written_memories"] == [{"summary": "用户住在杭州"}]
+            assert "用户喜欢草莓拿铁" in payload["known_memories"]
+            text = json.dumps({
+                "memories": [
+                    {"summary": "用户住在杭州", "content": "重复,应过滤"},
+                    {"summary": "用户养了一只叫蛋子的狗", "content": "用户养了一只叫蛋子的狗。"},
+                    {"summary": "用户喜欢草莓拿铁", "content": "known,应过滤"},
+                ]
+            }, ensure_ascii=False)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_memory_recheck_from_material(
+        user_id="usr_1",
+        job_id="job_1",
+        key_prefix="job_1:resident:recheck",
+        runtime=types.SimpleNamespace(),
+        material="用户养了一只叫蛋子的狗,还住在杭州。",
+        written_memories=[{"summary": "用户住在杭州"}],
+        known_memories=["用户喜欢草莓拿铁"],
+        llm=FakeLLM(),
+    )
+
+    assert [m["summary"] for m in output["memories"]] == ["用户养了一只叫蛋子的狗"]
+    assert calls[0]["task_id"] == "memory-recheck"
+    assert calls[0]["idempotency_key"] == "job_1:resident:recheck:memory_recheck"
+
+
+def test_memory_recheck_empty_is_valid_and_not_retried():
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs["task_id"])
+            text = json.dumps({"memories": []})
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_memory_recheck_from_material(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        material="只有寒暄,没有持久事实。",
+        written_memories=[],
+        llm=FakeLLM(),
+    )
+
+    assert output == {"memories": []}
+    assert calls == ["memory-recheck"]
+
+
+def test_memory_recheck_empty_material_short_circuits():
+    class FakeLLM:
+        def complete(self, **_kwargs):
+            raise AssertionError("empty material must not call the model")
+
+    output = worker.build_memory_recheck_from_material(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        material="",
+        written_memories=[],
+        llm=FakeLLM(),
+    )
+
+    assert output == {"memories": []}
+
+
 def test_user_profile_source_writes_memory_facts_without_identity_or_persona(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(

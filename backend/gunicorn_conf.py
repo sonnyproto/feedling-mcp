@@ -36,6 +36,29 @@ def _worker_count() -> int:
 workers = _worker_count()
 
 
+# Worker 定期回收：结构性内存上限。2026-07-14 prod 实测：请求处理的分配 churn 散布在
+# anyio 线程池 40 线程的 glibc per-thread arena 里（每 worker ~60 个 64MiB arena、
+# 近乎全驻留、占 RSS 80%+），12h 涨到 2-3GB/worker 且不自趋稳；CVM 无 swap，
+# available < 1000M 就进内核 OOM killer 红线（可能误杀 enclave 容器）。arena 高水位
+# 只涨不还，进程回收是唯一可靠的归零手段。
+#
+# 尺寸是双边约束（2026-07-14 test 实测踩过下限）：
+#   - 上限：回收周期须远早于内存红线。prod 每 worker ~15.5 req/s、涨 ~0.2GB/h →
+#     50k 请求 ≈ ~54-65min 寿命、峰值 ~0.2-0.3GB/worker，远离红线。
+#   - 下限：寿命必须盖过 leader 单例的后台长任务。2000 请求在 prod = **~2 分钟**
+#     一次回收——长轮询高频被排空、tee-sync/:9998 WS leader 反复换手，in-process
+#     reconcile（数十分钟）永远跑不完（test 实测：部署后 2h 零 tee-sync tick）。
+# jitter 必须非零：4 个 worker 几乎同速消化请求，无 jitter 会同时到阈值同时回收
+# → 服务闪断。
+max_requests = 50000
+max_requests_jitter = 10000
+
+# 回收/重启时排空在途请求的窗口。gunicorn 默认 30s，而 /v1/chat/poll 长轮询本身
+# 最长 30s——贴着悬崖，回收瞬间正好 park 住的 consumer 会被掐断（它靠重试恢复，
+# 但每次回收都制造一批假错误）。120s 让最长的长轮询 + 收尾写从容排空。
+graceful_timeout = 120
+
+
 # Idle timeout for keep-alive connections. gunicorn's default is 2s and
 # uvicorn_worker maps this straight onto uvicorn's ``timeout_keep_alive``.
 # At 2s the server closes an idle connection while still omitting

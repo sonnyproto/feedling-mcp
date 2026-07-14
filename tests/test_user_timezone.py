@@ -137,3 +137,37 @@ def test_record_context_timezone_rejects_invalid(client):
     from perception import service as perception_service
     assert perception_service.record_context_timezone(user_id, "Not/AZone") is False
     assert registry._get_user_timezone(user_id) is None
+
+
+def test_set_user_timezone_unchanged_skips_persist(client, monkeypatch):
+    """重复上报同一 timezone（iOS app-presence 每分钟都带）不得触发
+    persist_user——那是一次 users 行 upsert + TEE mirror + 全 worker 整表
+    reload 广播。值没变就必须是纯 no-op。"""
+    user_id, _pid, _api_key = _register(client)
+    assert registry._set_user_timezone(user_id, "Asia/Shanghai") is True
+
+    calls: list[dict] = []
+    monkeypatch.setattr(registry, "persist_user", lambda u: calls.append(u))
+    assert registry._set_user_timezone(user_id, "Asia/Shanghai") is True
+    assert calls == []
+    assert registry._get_user_timezone(user_id) == "Asia/Shanghai"
+
+
+def test_set_user_timezone_clear_when_unset_skips_persist(client, monkeypatch):
+    """清空一个本来就没设的 timezone 同样是 no-op，不广播。"""
+    user_id, _pid, _api_key = _register(client)
+    calls: list[dict] = []
+    monkeypatch.setattr(registry, "persist_user", lambda u: calls.append(u))
+    assert registry._set_user_timezone(user_id, None) is True
+    assert calls == []
+
+
+def test_set_user_timezone_change_still_persists(client, monkeypatch):
+    """值真变了必须照旧 persist + 广播（回归守卫）。"""
+    user_id, _pid, _api_key = _register(client)
+    assert registry._set_user_timezone(user_id, "Asia/Shanghai") is True
+    calls: list[dict] = []
+    monkeypatch.setattr(registry, "persist_user", lambda u: calls.append(u))
+    assert registry._set_user_timezone(user_id, "Europe/Berlin") is True
+    assert len(calls) == 1
+    assert registry._get_user_timezone(user_id) == "Europe/Berlin"

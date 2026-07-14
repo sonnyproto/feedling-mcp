@@ -104,3 +104,33 @@ def test_aclose_async_http_client(monkeypatch):
     asyncio.run(provider_client.aclose_async_http_client())
     assert provider_client._shared_async_client is None
     assert client.is_closed
+
+
+def test_async_retries_without_temperature_on_temperature_400(monkeypatch):
+    """The async wire must downgrade identically to the sync one — this module keeps a
+    SINGLE openai-compat codec precisely so the two can't drift. The enclave's caption
+    path is async, so a temperature-deprecating model would 400 there too."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        if len(seen) == 1:
+            assert body["temperature"] == 0.1  # first attempt keeps determinism
+            return httpx.Response(400, json={
+                "error": {"message": "`temperature` is deprecated for this model."}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 3},
+        })
+
+    _mock_async_client(monkeypatch, handler)
+    cfg = provider_client.ProviderConfig(
+        provider="openai_compatible", model="claude-sonnet-5",
+        api_key="sk-x", base_url="https://relay.example/v1")
+    out = asyncio.run(provider_client.chat_completion_async(
+        cfg, [{"role": "user", "content": "hi"}], temperature=0.1))
+
+    assert out["reply"] == "ok"
+    assert len(seen) == 2
+    assert "temperature" not in seen[1]  # retry dropped it

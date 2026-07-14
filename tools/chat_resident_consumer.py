@@ -2345,7 +2345,7 @@ def _looks_like_agent_protocol_text(text: str) -> bool:
         stripped = fence.group(1).strip()
     if stripped.lower().startswith("json\n"):
         stripped = stripped[5:].strip()
-    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"')
+    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"', '"cards"')
     if not any(key in stripped for key in protocol_keys):
         return False
     # A bare protocol fragment is a key immediately followed by a colon
@@ -2588,11 +2588,14 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if marker in _JSON_NON_FINAL_EVENTS:
         return turn
 
-    # Capture-lane agents are asked to return a strict {"cards": [...]} JSON
-    # object. Preserve that JSON as the final text so the capture handler can
-    # parse it instead of treating it as an unknown non-chat payload.
+    # A {"cards": [...]} object is capture/dream-lane protocol, never a chat
+    # reply. Background lanes read the model's literal output (raw_text paths:
+    # _extract_text_from_cli_output / _raw_assistant_text plus the explicit
+    # bare-cards handling in _call_agent_http_simple) and never come through
+    # this parser — so here it can only be a chat/proactive turn echoing the
+    # capture format (e.g. after a capture turn in the shared --resume
+    # session). Drop it like any other agent-protocol payload.
     if isinstance(obj.get("cards"), list):
-        turn.messages.append(json.dumps({"cards": obj.get("cards")}, ensure_ascii=False))
         return turn
 
     # OpenClaw `agent --json` nests reply text under result.payloads[].text,
@@ -3227,6 +3230,17 @@ def _raw_assistant_text(body: Any) -> str:
     return ""
 
 
+def _bare_cards_json(body: Any) -> str:
+    """Serialized {"cards": [...]} when an HTTP runtime answers a capture/dream
+    prompt with a bare cards object (no reply field). The shared turn parser
+    deliberately drops the cards shape (chat-protocol guard), so the raw_text
+    lanes must recover it here — kept as one helper so the simple and OpenAI
+    paths can't drift. Returns "" for anything else."""
+    if isinstance(body, dict) and isinstance(body.get("cards"), list):
+        return json.dumps({"cards": body.get("cards")}, ensure_ascii=False)
+    return ""
+
+
 def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
@@ -3244,6 +3258,9 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         text = _raw_assistant_text(body)
         if text.strip():
             return text
+        cards_text = _bare_cards_json(body)
+        if cards_text:
+            return cards_text
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
         if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
@@ -3293,6 +3310,9 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
         text = _raw_assistant_text(body)
         if text.strip():
             return text
+        cards_text = _bare_cards_json(body)
+        if cards_text:
+            return cards_text
     turn = _agent_turn_from_raw(body)
     if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
         return body
@@ -7174,12 +7194,19 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
         if _consume_reply_parse_failed():
+            # Parse failure means call_agent already swapped agent_result for
+            # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
+            # reads as an unsolicited error bubble on a turn the user never
+            # started. Background lanes never surface errors in chat (same
+            # policy as the agent_call_failed branch above): report + fail the
+            # job, post nothing.
             _notify_agent_turn_failure(
                 ValueError("agent produced no usable reply after sanitization"),
                 foreground=False,
             )
-        else:
-            _note_agent_turn_success()
+            update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
+            continue
+        _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
@@ -8055,6 +8082,32 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
     return windows or ([text] if text.strip() else [])
 
 
+def _resident_floor_note() -> str:
+    """f(days) 蒸馏目标(机制 A,非闸门):数量由素材密度决定,下限只兜底防漏写,
+    期望值给个宽范围当参考。两层——先满足下限,再尽量接近期望上限;素材薄就少写、
+    绝不编造。后端暴露 memory_aspiration 就用真值,否则按下限估一个宽上限。
+    取不到状态返空(零影响)。"""
+    try:
+        st = _capture_get_json("/v1/bootstrap/status")
+        floor = int(st.get("memory_floor") or 0)
+        count = int(st.get("memories_count") or 0)
+        asp = int(st.get("memory_aspiration") or 0)
+        if asp <= floor:  # 后端未暴露期望值 → 按下限估一个宽上限(≈2.3×)
+            asp = max(floor + 2, round(floor * 2.3))
+        # 只要还没到期望上限就给引导(鼓励在下限之上继续挖真实记忆)。
+        if floor > 0 and count < asp:
+            return (
+                f"花园现有 {count} 张卡。真正该有多少,取决于这些素材里有多少【真实、有价值】"
+                f"的持久事实——把它们尽量都写全,别为精简丢真事实。参考:这段关系正常大概在 "
+                f"{floor}–{asp} 张之间;【先满足下限 {floor} 张】,再尽量接近上限。素材薄就少写、"
+                f"【宁缺毋滥、绝不编造】;但若你只找到远低于 {floor} 张,多半是漏了,回去再挖。"
+                f"仍按 known_memories 去重。"
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
     """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
     fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
@@ -8082,8 +8135,21 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
     mem_out = genesis_worker.build_memory_output_from_fact_candidates(
         user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
         runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
+        floor_note=_resident_floor_note(),
     )
-    return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+    memories = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+    # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
+    # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+    try:
+        recheck = genesis_worker.build_memory_recheck_from_material(
+            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
+            runtime=runtime, material=document, written_memories=memories, llm=llm,
+        )
+        genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
+        memories.extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+    except Exception:
+        log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
+    return memories
 
 
 def _resident_existing_identity() -> dict:
@@ -8098,9 +8164,10 @@ def _resident_existing_identity() -> dict:
         if not isinstance(body.get("identity"), dict):
             body = _capture_get_json("/v1/identity/get")
         identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        from identity import distill_prompt_v1 as _dp
         return {
             k: identity[k]
-            for k in ("agent_name", "self_introduction", "dimensions")
+            for k in _dp.RESIDENT_IDENTITY_FIELDS
             if identity.get(k) not in (None, "", [], {})
         }
     except Exception:
@@ -8109,41 +8176,22 @@ def _resident_existing_identity() -> dict:
 
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
+    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
+    card_policy 清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    from identity import distill_prompt_v1 as _dp
     existing = _resident_existing_identity()
-    # 部分补全: merge onto the current card so fields the upload doesn't mention stay put.
-    # DRAFT wording (Seven to finalize); mirrors the cloud _IDENTITY_UPDATE_MERGE_TEMPLATE.
-    merge_block = ""
-    if existing:
-        merge_block = (
-            "This is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
-            "Existing card:\n" + json.dumps(existing, ensure_ascii=False) + "\n"
-            "Merge rules:\n"
-            "- For fields the new material ADDRESSES, use the new values (latest wins). On a "
-            "SERIOUS conflict, the new material wins — the user uploaded it to change the card.\n"
-            "- For fields the new material does NOT address, KEEP the existing card's values "
-            "unchanged — do not blank them and do not invent replacements.\n"
-            "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction "
-            "/ tone_style to match, so no stale description from the old card survives.\n"
-        )
-    prompt = (
-        "The user uploaded a character/persona description for the companion (you). Derive the "
-        "identity card and return ONE JSON object, nothing else:\n"
-        '{"agent_name": str, "self_introduction": str, '
-        '"dimensions": [{"name": str, "value": 0-100, "description": str}]}\n'
-        "Ground every field in the material; return {} if there is no persona content.\n"
-        + merge_block
-        + "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
-    )
-    raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(raw[start:end + 1])
-    except Exception:
-        return None
-    return obj if isinstance(obj, dict) and obj.get("agent_name") else None
+    prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
+    for attempt in (1, 2):
+        raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+        payload = _dp.parse_identity_payload(raw)
+        if payload is not None:
+            return payload
+        log.warning("resident identity distill: unparseable output (attempt %d/2) job=%s head=%r",
+                    attempt, job_id, raw[:120])
+        prompt = prompt + "\nReturn ONLY the JSON object — no prose, no code fences."
+    log.error("resident identity distill failed after retry job=%s — skipping identity update", job_id)
+    return None
 
 
 def _process_resident_distill_once() -> None:

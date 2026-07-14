@@ -1,0 +1,78 @@
+---
+title: Changelog
+description: User-visible changes to the public Feedling API contract and developer documentation.
+---
+
+This public changelog starts with this developer-documentation work. Entries stay
+under **Unreleased** until a production deployment is confirmed. It does not
+reconstruct the repository's internal engineering history, and an omitted older
+change must not be interpreted as an API guarantee.
+
+## Unreleased
+
+### Documentation and contract
+
+- Add explicit JSON, multipart, query, path, and non-authentication header
+  contracts to the generated public OpenAPI document.
+- Add complete Chat, Memory, and Perception workflow examples.
+- Add a system architecture and trust-boundary guide covering managed and
+  self-hosted topology, encryption, tenant isolation, and capability readiness.
+- Document API key registration, additional-device issuance, keypair recovery,
+  and the absence of public per-key rotation and revocation.
+- Document endpoint-specific pagination, rate-limit, timeout, retry, and
+  idempotency behavior.
+- Add scoped API-playground credential cleanup instructions and a button that
+  removes only `fumadocs-openapi-auth-*` local-storage entries.
+- Add the current versioning, deprecation, and experimental self-hosting status.
+
+These documentation additions describe existing behavior; they do not by
+themselves add a backend endpoint or change production request handling.
+
+### Developer docs preview
+
+- Publish a filtered OpenAPI reference for public account, encrypted Chat,
+  Memory, model-routing, Perception, and proactive endpoints.
+- Add an interactive browser playground with Production and Staging server
+  selection.
+- Add getting-started, authentication, and error-handling guides.
+
+### Storage and deployment
+
+- Heavy Chat **image** bodies are now offloaded to object storage alongside file
+  bodies, under a separate `chatimages/` key prefix so image retention and usage
+  can be governed on their own. The message row keeps envelope metadata plus a
+  pointer; the ciphertext is re-fetched only at the exits that deliver a body.
+  The request and response shapes are unchanged.
+- Operator impact: the chat object-storage bucket now backs image bodies too.
+  Disabling it, repointing it, or scoping its credential too narrowly **after**
+  pointer rows exist makes those image bodies unreadable, not just file bodies.
+  It is part of the primary data set and must be backed up with the database.
+- Image bodies written before this change remain inline in the database and keep
+  working. An offline backfill moves them; it is idempotent and safe to re-run.
+- Object reads and deletes are constrained to the requesting account's own key
+  prefix, so a malformed or hand-repaired pointer cannot reach another account's
+  ciphertext.
+
+### Security
+
+- Browser API access is limited to the documentation site's exact configured
+  origin. CORS does not bypass API-key or runtime-token authorization.
+- Require a long-lived API key for link-token creation, destructive account
+  reset, and Perception report ingestion; runtime tokens are rejected on these
+  control-plane boundaries.
+- Permit the documented resident, range, cache-validation, and Genesis chunk
+  headers through that exact-origin CORS policy without enabling credentials or
+  wildcard origins.
+- The playground warns that Production requests operate on the authenticated
+  account's live data and persists credentials in browser local storage.
+
+### Deprecations
+
+- None in the public OpenAPI contract.
+
+## Reading this changelog
+
+“Added” normally means backward-compatible surface area. “Changed” can require a
+client review even when the `/v1` path remains stable. “Deprecated” begins the
+process described in [versioning and deprecation](/docs/versioning); it does not
+imply a removal date unless the entry states one explicitly.

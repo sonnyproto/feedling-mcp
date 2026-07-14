@@ -1,0 +1,17 @@
+{
+  "title": "Feedling API",
+  "pages": [
+    "index",
+    "getting-started",
+    "authentication",
+    "api-keys",
+    "architecture",
+    "workflows",
+    "reliability",
+    "errors",
+    "api-reference",
+    "versioning",
+    "changelog",
+    "self-hosting"
+  ]
+}
