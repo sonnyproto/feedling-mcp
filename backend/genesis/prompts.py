@@ -222,22 +222,22 @@ def fact_write_messages(fact_digest: list[dict], persona_material: str = "", mem
     floor_note_text = (("\n\n★ " + str(floor_note).strip()) if str(floor_note or "").strip() else "")
 
     if floor_note_text:
-        # Insert floor_note before the firewall section (which precedes JSON spec)
+        # Insert floor_note before the firewall section, but anchor keep_all_suffix at the end
         firewall_idx = FACT_WRITE_PROMPT.find("\n防火墙:")
         if firewall_idx > 0:
             system = (
                 FACT_WRITE_PROMPT[:firewall_idx]
-                + keep_all_suffix
                 + floor_note_text
                 + FACT_WRITE_PROMPT[firewall_idx:]
+                + keep_all_suffix
                 + _STRICT_JSON_SUFFIX
             )
         else:
             # Fallback if marker not found
             system = (
                 FACT_WRITE_PROMPT
-                + keep_all_suffix
                 + floor_note_text
+                + keep_all_suffix
                 + _STRICT_JSON_SUFFIX
             )
     else:

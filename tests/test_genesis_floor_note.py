@@ -23,6 +23,17 @@ def test_floor_note_appended_to_system():
 
 def test_floor_note_composes_with_keep_all():
     note = "参考下限 38"
-    msgs = prompts.fact_write_messages([{"summary": "s"}], keep_all=True, floor_note=note)
-    assert "长期档案" in msgs[0]["content"]
-    assert note in msgs[0]["content"]
+    ka_only = prompts.fact_write_messages([{"summary": "s"}], keep_all=True)
+    both = prompts.fact_write_messages([{"summary": "s"}], keep_all=True, floor_note=note)
+
+    assert "长期档案" in both[0]["content"]
+    assert note in both[0]["content"]
+
+    # keep_all suffix stays ANCHORED: strip the note insertion → byte-identical to keep_all-only
+    floor_insert = _floor_insert(note)
+    assert both[0]["content"].replace(floor_insert, "") == ka_only[0]["content"]
+
+
+def _floor_insert(note: str) -> str:
+    """Return the exact text inserted before the firewall marker."""
+    return (("\n\n★ " + str(note).strip()) if str(note or "").strip() else "")
