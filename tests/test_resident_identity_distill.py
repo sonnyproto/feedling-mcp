@@ -93,3 +93,35 @@ def test_floor_note_empty_on_error(monkeypatch):
         raise RuntimeError("api down")
     monkeypatch.setattr(crc, "_capture_get_json", boom)
     assert crc._resident_floor_note() == ""
+
+
+def test_memory_snapshot_composes_terms_and_known(monkeypatch):
+    def fake_get(path, **kw):
+        if path == "/v1/memory/buckets":
+            return {"buckets": [{"name": "工作", "count": 3}, {"name": "协作方式", "count": 2}]}
+        if path == "/v1/memory/threads":
+            return {"threads": [{"name": "查证不猜"}]}
+        return {}
+    monkeypatch.setattr(crc, "_capture_get_json", fake_get)
+    monkeypatch.setattr(crc, "_resident_memory_index_summaries",
+                        lambda: ["hx 是 Teleport 前端", "hx 的红线:优先成功率"])
+    terms, known = crc._resident_memory_snapshot()
+    assert "工作" in terms and "协作方式" in terms and "查证不猜" in terms
+    assert "复用" in terms          # 引导语:先复用,别造近义/中英重复桶
+    assert known == ["hx 是 Teleport 前端", "hx 的红线:优先成功率"]
+
+
+def test_memory_snapshot_empty_garden_returns_empty(monkeypatch):
+    monkeypatch.setattr(crc, "_capture_get_json", lambda path, **kw: {})
+    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
+    terms, known = crc._resident_memory_snapshot()
+    assert terms == "" and known == []
+
+
+def test_memory_snapshot_error_returns_empty(monkeypatch):
+    def boom(path, **kw):
+        raise RuntimeError("api down")
+    monkeypatch.setattr(crc, "_capture_get_json", boom)
+    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
+    terms, known = crc._resident_memory_snapshot()
+    assert terms == "" and known == []

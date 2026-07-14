@@ -8073,6 +8073,66 @@ def _resident_floor_note() -> str:
     return ""
 
 
+def _resident_memory_index_summaries() -> list[str]:
+    """Best-effort /v1/memory/index read → per-card summary strings for known_memories
+    (semantic dedup guidance to fact_write). Cap 200 entries x 160 chars — a prompt-sized
+    digest, not a full dump. Any failure/empty garden → [] (zero impact)."""
+    try:
+        body = _capture_post_json(
+            "/v1/memory/index",
+            payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
+            timeout=20,
+        )
+        items = body.get("items") if isinstance(body.get("items"), list) else []
+        out: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            summary = str(item.get("summary") or "").strip()
+            if summary:
+                out.append(summary[:160])
+            if len(out) >= 200:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _resident_memory_snapshot() -> tuple[str, list[str]]:
+    """One-shot read of the memory garden before a resident distill job: existing bucket/
+    thread names (so fact_write reuses instead of inventing near-synonym or bilingual
+    duplicate buckets) + known-memory summaries (so fact_write can semantically dedup via
+    known_memories). Fetch ONCE per job, reuse across the whole window loop — not once per
+    window. Empty garden or any error → ("", []), zero impact (parallels _resident_floor_note)."""
+    try:
+        buckets_body = _capture_get_json("/v1/memory/buckets")
+        threads_body = _capture_get_json("/v1/memory/threads")
+        bucket_names = [
+            str(b.get("name") or "").strip()
+            for b in (buckets_body.get("buckets") or [])
+            if isinstance(b, dict) and str(b.get("name") or "").strip()
+        ]
+        thread_names = [
+            str(t.get("name") or "").strip()
+            for t in (threads_body.get("threads") or [])
+            if isinstance(t, dict) and str(t.get("name") or "").strip()
+        ]
+        known = _resident_memory_index_summaries()
+        if not bucket_names and not thread_names:
+            return "", known
+        terms = (
+            "现有记忆桶/线索(先复用现有桶/线索,别造近义或中英重复桶——"
+            "例:已有「工作」别再造「Work」):\n"
+        )
+        if bucket_names:
+            terms += "buckets: " + "、".join(bucket_names) + "\n"
+        if thread_names:
+            terms += "threads: " + "、".join(thread_names) + "\n"
+        return terms.strip(), known
+    except Exception:
+        return "", []
+
+
 def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
     """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
     fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
@@ -8087,6 +8147,7 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
     llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
     runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
+    terms_note, known_memories = _resident_memory_snapshot()  # one-shot: fetch once, reuse for whole job
     candidates: list[dict] = []
     for idx, window in enumerate(_window_document(document), start=1):
         out = genesis_worker.build_foreground_output_from_texts(
@@ -8101,6 +8162,7 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
         user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
         runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
         floor_note=_resident_floor_note(),
+        known_memories=known_memories, terms_note=terms_note,
     )
     return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
 
