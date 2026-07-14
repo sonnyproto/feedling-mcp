@@ -1659,8 +1659,9 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
     fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic → claude；openai → codex (native)；其余 fit provider
-    （deepseek/gemini/openrouter/openai_compatible）→ pi。
+    anthropic/deepseek → claude（deepseek 走其 /anthropic 兼容层，Anthropic wire）；
+    openai → codex (native)；其余 fit provider
+    （gemini/openrouter/openai_compatible）→ pi。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
@@ -1676,6 +1677,7 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
+                    WHEN 'deepseek'  THEN 'claude'
                     WHEN 'openai'    THEN 'codex'
                     ELSE 'pi'
                   END AS driver,

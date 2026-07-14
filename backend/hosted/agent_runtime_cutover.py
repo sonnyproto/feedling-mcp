@@ -32,13 +32,15 @@ _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
 # The agent driver is DERIVED from the provider, never user-chosen: each CLI is
 # locked to a wire format (Claude Code = Anthropic Messages, Codex = OpenAI
 # Responses, pi = OpenAI-completions-compatible). Empirically (2026-06-25):
-# Claude Code handles ONLY anthropic (its native Anthropic Messages wire).
+# Claude Code handles ONLY the Anthropic Messages wire — native anthropic plus
+# deepseek, whose /anthropic endpoint speaks that wire (the CLI is pointed at it
+# via ANTHROPIC_BASE_URL, see spawners._claude_anthropic_base_url).
 # Codex is openai-native only (direct OpenAI Responses). The in-CVM LiteLLM
-# gateway is retired: gemini/openrouter/openai_compatible/deepseek route
+# gateway is retired: gemini/openrouter/openai_compatible route
 # through the pi driver instead, which speaks the openai-completions wire
 # directly with a per-user custom baseUrl (no gateway hop). Keep this map in
 # sync with the SQL CASE in db.list_agent_runtime_enabled_users.
-_CLAUDE_PROVIDERS = {"anthropic"}
+_CLAUDE_PROVIDERS = {"anthropic", "deepseek"}
 # Codex-driven providers: openai only (native OpenAI Responses). A provider not
 # here, not in _CLAUDE_PROVIDERS, and not in _PI_PROVIDERS has no hosted fit →
 # ``legacy``.
@@ -47,16 +49,16 @@ _CODEX_PROVIDERS = {"openai"}
 # per-user custom baseUrl, so these relays connect DIRECTLY — no gateway hop.
 # Unconditional (no flag). Keep in sync with the SQL CASE in
 # db.list_agent_runtime_enabled_users.
-_PI_PROVIDERS = {"openai_compatible", "gemini", "openrouter", "deepseek"}
+_PI_PROVIDERS = {"openai_compatible", "gemini", "openrouter"}
 
 
 def driver_for_provider(provider: str) -> str:
     """The agent driver for a provider key — auto-derived, NOT user-chosen.
 
-    anthropic → ``claude`` (Anthropic-wire CLI); openai_compatible / gemini /
-    openrouter / deepseek → ``pi`` (direct relay, no gateway), unconditionally;
-    openai → ``codex`` (native OpenAI Responses). No configured fit →
-    ``legacy``."""
+    anthropic / deepseek → ``claude`` (Anthropic-wire CLI; deepseek via its
+    /anthropic-compatible endpoint); openai_compatible / gemini / openrouter →
+    ``pi`` (direct relay, no gateway), unconditionally; openai → ``codex``
+    (native OpenAI Responses). No configured fit → ``legacy``."""
     p = provider_client.normalize_provider(provider)
     if p in _CLAUDE_PROVIDERS:
         return "claude"

@@ -258,15 +258,6 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
       `Model "feedling/<id>" not found` (rc=1) before any request goes out. This
       branch shipped without one and gemini turns failed 100%; see
       ``test_pi_models_gemini_always_has_base_url``.
-    - ``deepseek`` → pi's native ``anthropic-messages`` api against
-      ``<base_url or https://api.deepseek.com>/anthropic``; no ``compat``
-      block (that's openai-completions-specific) and the model entry is
-      TEXT-ONLY (``input: ["text"]``, built inline — deepseek's models don't
-      accept image content, unlike the shared ``["text", "image"]`` entry
-      used by the other branches). Moved here from the claude driver, which
-      used to point ANTHROPIC_BASE_URL at this same ``/anthropic`` endpoint
-      (see ``_claude_anthropic_base_url``). Conservative: no reasoning
-      forwarding for deepseek yet.
     - ``openrouter`` → openrouter's fixed public endpoint + the
       ``HTTP-Referer``/``X-Title`` headers openrouter asks callers to send.
     - ``openai_compatible`` (and any other/empty provider — legacy default) →
@@ -289,10 +280,8 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     openai-completions branches (openrouter, openai_compatible) also carry
     ``compat.supportsReasoningEffort``; openrouter pins
     ``compat.thinkingFormat="openrouter"`` (its ``reasoning: {effort}`` wire).
-    deepseek stays text-only/no-reasoning (conservative — its Anthropic-wire
-    wasn't verified against reasoning passthrough). Each branch builds its OWN
-    model_entry dict (never a shared mutable one) so the reasoning flag can't
-    leak across providers.
+    Each branch builds its OWN model_entry dict (never a shared mutable one) so
+    the reasoning flag can't leak across providers.
 
     ``input: ["text", "image"]`` declares the model's accepted modalities: pi
     only sends attached images as real vision content when the model's ``input``
@@ -319,16 +308,6 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
             "api": "google-generative-ai",
             "apiKey": "$PI_PROVIDER_API_KEY",
             "models": [model_entry],
-        }
-    elif p == "deepseek":
-        base = (base_url or "https://api.deepseek.com").strip().rstrip("/")
-        prov = {
-            "name": "Feedling relay",
-            "baseUrl": f"{base}/anthropic",
-            "api": "anthropic-messages",
-            "apiKey": "$PI_PROVIDER_API_KEY",
-            "models": [{"id": (model or "").strip() or "deepseek-chat",
-                        "input": ["text"]}],
         }
     elif p == "openrouter":
         model_entry = {
@@ -383,13 +362,24 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     return json.dumps(doc, indent=2) + "\n"
 
 
+# claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
+# Anthropic-compatible API at ``<base_url>/anthropic`` and use their own model id.
+# Keep in sync with hosted/agent_runtime_cutover._CLAUDE_PROVIDERS.
+_CLAUDE_COMPAT_BASE_URLS = {"deepseek": "https://api.deepseek.com"}
+
+
 def _claude_anthropic_base_url(entry: dict) -> str:
-    """Always "" now — deepseek (the only Anthropic-wire third party) moved to the
-    pi driver's ``anthropic-messages`` branch (see ``_pi_models_json``), so the
-    claude driver serves only native anthropic, whose CLI default
-    (api.anthropic.com) is already correct. Kept (rather than inlined at the call
-    site) so that call site doesn't change."""
-    return ""
+    """For a claude-driver entry, the ANTHROPIC_BASE_URL the CLI must use, or "".
+
+    Native anthropic returns "" (the CLI default api.anthropic.com is correct).
+    deepseek (and any future Anthropic-wire third party) returns its
+    ``<base_url>/anthropic`` endpoint — without this the CLI sends the foreign key
+    to api.anthropic.com and every turn fails with a non-zero exit."""
+    provider = (entry.get("provider") or "").strip().lower()
+    if provider not in _CLAUDE_COMPAT_BASE_URLS:
+        return ""
+    base = (entry.get("base_url") or _CLAUDE_COMPAT_BASE_URLS[provider]).strip().rstrip("/")
+    return f"{base}/anthropic"
 
 
 def _is_official_identity(provider: str, base_url: str) -> bool:
@@ -563,6 +553,8 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
 
 def _claude_cli_should_stream_thinking(entry: dict) -> bool:
     provider = (entry.get("provider") or "").strip().lower()
+    if provider == "deepseek":
+        return True
     if provider != "anthropic":
         return False
     model = (entry.get("model") or "").strip().lower()
@@ -839,10 +831,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
         model = (entry.get("model") or "").strip()
         if model:
             env["ANTHROPIC_MODEL"] = model
-        # deepseek (the only Anthropic-wire third party) moved to the pi driver's
-        # anthropic-messages branch (see _pi_models_json), so _claude_anthropic_base_url
-        # always returns "" now and this override is a no-op — kept only in case a
-        # future claude-wire third party needs it again.
+        # Non-anthropic claude-wire providers (deepseek) must point the CLI at
+        # their /anthropic endpoint + own model — otherwise the CLI hits
+        # api.anthropic.com with a foreign key and every turn exits non-zero.
         anthropic_base = _claude_anthropic_base_url(entry)
         if anthropic_base:
             env["ANTHROPIC_BASE_URL"] = anthropic_base

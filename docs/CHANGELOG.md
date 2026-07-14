@@ -49,6 +49,20 @@
 
 ## 2026-07-14
 
+### [DECISION] deepseek 从 pi 驱动改回 claude（cc）驱动
+
+- 驱动派生改回：`deepseek` → `claude`（Claude Code CLI，
+  `ANTHROPIC_BASE_URL={base_url}/anthropic` 指向 deepseek 的 Anthropic 兼容层），
+  撤销 07-13 pi consolidation 把 deepseek 归入 pi anthropic-messages 桥的部分
+  （该桥未验证，07-14 usr_a7b0aba7 事故：胡言乱语 + 图片被注入 "(image omitted)"
+  + 批量慢回）。gemini/openrouter/openai_compatible 维持 pi 不变。
+- 改动三处 + 测试：`hosted/agent_runtime_cutover.py`（`_CLAUDE_PROVIDERS`
+  加回 deepseek）、`db.list_agent_runtime_enabled_users` SQL CASE
+  （`deepseek→claude`）、`agent_runtime/spawners.py`（恢复
+  `_CLAUDE_COMPAT_BASE_URLS`/`_claude_anthropic_base_url`、deepseek 走
+  thinking-claude 命令、删除 `_pi_models_json` 的 deepseek 分支）。
+- 行为即 07-13 之前的 prod 状态（deepseek→claude 实测可用，见 2026-06-25 记录）。
+
 ### [DONE] backend 内存增长根因修复（arena 膨胀 + 三个 churn 源）
 
 - **根因**（prod 实测取证）：backend worker RSS 无界增长（12h 到 2-3GB/worker）

@@ -108,8 +108,9 @@ def _seed_all(_clean_blobs):
 
 def test_list_enabled_users_unconditional_all_fit_providers(_clean_blobs):
     # Discovery is unconditional now — no gateway proxy to avoid, so every fit
-    # provider (native claude/codex plus pi-driven deepseek/gemini/openrouter/
-    # openai_compatible) is discovered in one pass, no include_gateway switch.
+    # provider (claude-wire anthropic/deepseek, codex-native openai, plus
+    # pi-driven gemini/openrouter/openai_compatible) is discovered in one pass,
+    # no include_gateway switch.
     # Flag (agent_runtime_driver) is no longer a gate — test_ok + fit provider suffices;
     # anthropic_off (agent_runtime_driver='legacy') is now included.
     _seed_all(_clean_blobs)
@@ -117,7 +118,7 @@ def test_list_enabled_users_unconditional_all_fit_providers(_clean_blobs):
     assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
         "anthropic_off": "claude",   # legacy flag no longer gates discovery
-        "deepseek_on": "pi",
+        "deepseek_on": "claude",   # Anthropic-wire /anthropic compat endpoint
         "openai_on": "codex",
         "gemini_on": "pi",
         "openrouter_on": "pi",
@@ -134,11 +135,11 @@ def test_list_enabled_users_unconditional_all_fit_providers(_clean_blobs):
 
 
 def test_discovery_pi_providers(_clean_blobs):
-    for p in ("gemini", "openrouter", "openai_compatible", "deepseek"):
+    for p in ("gemini", "openrouter", "openai_compatible"):
         _seed_model_api(f"{p}_u", provider=p, test_status="ok",
                         base_url="https://relay/v1" if p == "openai_compatible" else "")
     rows = {r["user_id"]: r for r in db.list_agent_runtime_enabled_users()}
-    for p in ("gemini", "openrouter", "openai_compatible", "deepseek"):
+    for p in ("gemini", "openrouter", "openai_compatible"):
         assert rows[f"{p}_u"]["driver"] == "pi"
 
 

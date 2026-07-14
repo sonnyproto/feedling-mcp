@@ -112,7 +112,7 @@ def test_enabling_hosting_derives_codex_for_openai(client):
 
 
 def test_pi_provider_derives_pi_unconditionally(client, monkeypatch):
-    # LiteLLM gateway retired: gemini/openrouter/openai_compatible/deepseek now
+    # LiteLLM gateway retired: gemini/openrouter/openai_compatible now
     # derive the pi driver unconditionally (direct relay, no gateway flag).
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="gemini")
