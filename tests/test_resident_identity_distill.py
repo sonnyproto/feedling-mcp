@@ -82,9 +82,20 @@ def test_floor_note_below_floor(monkeypatch):
     assert "绝不编造" in note
 
 
-def test_floor_note_empty_at_or_above_floor(monkeypatch):
+def test_floor_note_between_floor_and_aspiration_still_guides(monkeypatch):
+    # two-tier (Xiaoting 763b0b03): floor is only the backstop; guidance keeps
+    # encouraging real facts up to the aspiration (~2.3x floor when backend
+    # doesn't expose one). 40 >= floor 38 but < asp 87 -> note still present.
     monkeypatch.setattr(crc, "_capture_get_json",
                         lambda path, **kw: {"memory_floor": 38, "memories_count": 40})
+    note = crc._resident_floor_note()
+    assert "38" in note and "87" in note
+    assert "绝不编造" in note
+
+
+def test_floor_note_empty_at_or_above_aspiration(monkeypatch):
+    monkeypatch.setattr(crc, "_capture_get_json",
+                        lambda path, **kw: {"memory_floor": 38, "memories_count": 90})
     assert crc._resident_floor_note() == ""
 
 

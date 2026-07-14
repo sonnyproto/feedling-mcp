@@ -714,7 +714,7 @@ def test_memory_verify_guidance_only_below_floor(backend):
     body = r.json()
     assert body["counts"]["total"] == 2
     assert body["relationship_days"] >= 30
-    assert body["memory_floor"] == 15
+    assert body["memory_floor"] == 12
     assert body["memory_below_floor"] is True
     # Never a gate, regardless of how far below floor the garden is.
     assert body["passing"] is True
@@ -722,7 +722,7 @@ def test_memory_verify_guidance_only_below_floor(backend):
     # Per-tab keys survive for shape-compat but never fire in v2.
     assert body["below_floor"] == {"story": False, "about_me": False, "ta_thinking": False}
     assert len(body["suggestions"]) == 1
-    assert "参考下限约 15 张" in body["suggestions"][0]
+    assert "参考下限约 12 张" in body["suggestions"][0]
     assert "409" not in json.dumps(body)
 
 
