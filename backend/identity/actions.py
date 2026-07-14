@@ -454,6 +454,12 @@ def _identity_replace_action(
         current_replaced_at = str((current_identity or {}).get("replaced_at") or "")
         if base_identity_replaced_at != current_replaced_at:
             return {"status": "error", "error": "identity_base_stale", "action": "identity.replace"}, [], 409
+    # Cloud plaintext role-card uploads use the shared service helper as an
+    # upsert. Resident identity.replace remains replace-only: its create path is
+    # owned by the resident consumer protocol and must not leak through here.
+    if not identity_service._load_identity(store):
+        return {"status": "error", "error": "identity_not_initialized",
+                "action": "identity.replace"}, [], 409
     from genesis import service as genesis_service  # lazy — avoid import cycle
     result = genesis_service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}
