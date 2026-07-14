@@ -196,6 +196,7 @@ jobs:
       - name: Run deterministic qualification tests
         run: >-
           python -m pytest -q
+          --basetemp "${RUNNER_TEMP}/feedling-qa-pytest-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           qa/tests
           tools/provider_smoke/tests
           tests/test_genesis_distill_acceptance.py

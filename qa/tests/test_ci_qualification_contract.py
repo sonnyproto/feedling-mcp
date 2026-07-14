@@ -23,6 +23,8 @@ def test_deterministic_qualification_contracts_gate_test_and_production_deploys(
     production_deploy = _job("deploy-cvm", "deploy-test-cvm")
 
     assert "python -m pytest -q" in qa_job
+    assert '--basetemp "${RUNNER_TEMP}/feedling-qa-pytest-' in qa_job
+    assert "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" in qa_job
     assert "qa/tests" in qa_job
     assert "tools/provider_smoke/tests" in qa_job
     assert "tests/test_genesis_distill_acceptance.py" in qa_job

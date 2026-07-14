@@ -321,8 +321,42 @@ def test_codex_locator_never_executes_arbitrary_path_binary(tmp_path, monkeypatc
     )
     fake.chmod(0o700)
     monkeypatch.setattr(local.shutil, "which", lambda _name: str(fake))
+    machine = local.platform.machine().lower()
+    if machine == "aarch64":
+        machine = "arm64"
+    monkeypatch.setattr(
+        local,
+        "_TRUSTED_LOCAL_CODEX",
+        {
+            (local.sys.platform, machine): {
+                "package_dir": "codex-test-platform",
+                "package_version": "0.144.3-test-platform",
+                "target": "test-target",
+                "tree_sha256": "0" * 64,
+            }
+        },
+    )
 
     with pytest.raises(local.LocalDiagnosticError, match="official npm"):
+        local._resolve_trusted_codex_binary()
+
+    assert not marker.exists()
+
+
+def test_codex_locator_fails_closed_before_executing_on_unsupported_platform(
+    tmp_path, monkeypatch
+):
+    marker = tmp_path / "executed"
+    fake = tmp_path / "codex"
+    fake.write_text(
+        f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\necho 'codex-cli 0.144.3'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o700)
+    monkeypatch.setattr(local.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(local, "_TRUSTED_LOCAL_CODEX", {})
+
+    with pytest.raises(local.LocalDiagnosticError, match="no pinned Codex artifact"):
         local._resolve_trusted_codex_binary()
 
     assert not marker.exists()
