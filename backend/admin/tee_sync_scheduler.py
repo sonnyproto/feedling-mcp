@@ -197,10 +197,20 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
     return reconcile_ok
 
 
+def _should_reconcile(last_reconcile: float | None, now: float) -> bool:
+    """首个 tick（``last_reconcile is None``）**必** reconcile —— 先把明文父表
+    （users 等）基线灌进 TEE，否则子表的双写/复制全撞 users 外键。
+
+    绝不能靠「``monotonic()`` 起点必 > reconcile 间隔」来触发首轮:宿主 uptime <
+    间隔（86400s=1天;刚部署的 CVM 就是）时 ``monotonic()`` 很小、首 tick 不 reconcile，
+    users 基线一直不灌 → FK 全线失败烧日志（2026-07-14 prod 实测,dual-write 开着但
+    reconcile 从没跑过）。用 None 哨兵与 monotonic 的绝对值解耦。之后按 reconcile 间隔。"""
+    return last_reconcile is None or (now - last_reconcile) >= _reconcile_interval()
+
+
 def _loop() -> None:
-    # monotonic()，起点非 0 → 首个 tick 的 (now - 0) 必然 >= 间隔 → 首轮就 reconcile
-    # （初始回填明文父表 + 游标从头搬密文）。
-    last_reconcile = 0.0
+    # last_reconcile=None → 首个成功 tick 必 reconcile 建立基线（见 _should_reconcile）。
+    last_reconcile: float | None = None
     first = True
     while True:
         # 首个 tick 只等一小会儿就跑 —— 尽快把明文父表回填上，缩短「父表未回填 →
@@ -210,7 +220,7 @@ def _loop() -> None:
         if not mirror.enabled():
             continue
         now = time.monotonic()
-        do_reconcile = (now - last_reconcile) >= _reconcile_interval()
+        do_reconcile = _should_reconcile(last_reconcile, now)
         try:
             reconcile_ok = _sync_tick(do_reconcile=do_reconcile)
             # 仅在 reconcile 真成功时推进计时器；失败(断连等)则保持不动，下个 tick

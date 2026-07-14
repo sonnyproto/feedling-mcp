@@ -143,3 +143,16 @@ def test_failed_reconcile_returns_false_for_soon_retry(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     # reconcile failed → False so _loop won't advance last_reconcile (retries next tick).
     assert sched._sync_tick(do_reconcile=True) is False
+
+
+def test_first_tick_always_reconciles_regardless_of_monotonic(monkeypatch):
+    """首个 tick(last_reconcile is None)必 reconcile —— 建立 users 基线,不能靠
+    monotonic() 的绝对值(宿主 uptime 小的新 CVM 上它 < reconcile 间隔 → 旧逻辑首 tick
+    不 reconcile → FK 全线失败,2026-07-14 prod 实测)。"""
+    monkeypatch.setenv("FEEDLING_TEE_RECONCILE_INTERVAL_SEC", "86400")
+    # 新进程:last_reconcile=None,monotonic 才几秒(远 < 86400)——旧逻辑会返回 False。
+    assert sched._should_reconcile(None, 5.0) is True
+    # 已 reconcile 过:未到间隔不重跑
+    assert sched._should_reconcile(1000.0, 1000.0 + 86399) is False
+    # 到间隔:重跑
+    assert sched._should_reconcile(1000.0, 1000.0 + 86400) is True
