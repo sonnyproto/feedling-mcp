@@ -2155,6 +2155,11 @@ def _render_data_track_dau_page(payload: dict) -> str:
   {_render_data_track_view_nav("dau")}
   <section class="metrics">{metrics}</section>
   <h2>Daily Active Users</h2>
+  <div style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7;color:#5a4d3c">
+    <b>⚠️ 历史数据偏少 · 已知问题</b><br>
+    每日快照上线之前的历史数据，是<b>每次打开页面时从当前还存在的数据实时重算</b>的，没有冻结快照。用户<b>删除/重置账户后其消息会被级联删除</b>，会<b>追溯性地</b>减少他活跃过的每一天——所以过去某天的 DAU 会随时间下降、<b>看起来偏少、不完全可靠，仅供参考</b>。<br>
+    从每日快照功能上线之后的日期起，当天真实数据会<b>冻结</b>、不再变化、准确。
+  </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
   <div class="muted">使用DAU=当天有 app 使用时长上报的用户数；平均使用时长=当天所有会话的平均前台时长；会话数=当天 app_session_end 事件数。前台被杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
