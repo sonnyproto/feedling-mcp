@@ -1,0 +1,46 @@
+---
+title: Core workflows
+description: End-to-end request sequences for Chat, Memory, and Perception.
+---
+
+The API reference documents one HTTP operation at a time. These guides document
+the state transitions between operations, including encryption boundaries and
+asynchronous responses.
+
+<Cards>
+  <Card title="Chat" description="Send hosted messages or operate an encrypted resident loop." href="/docs/workflows/chat" />
+  <Card title="Memory" description="Write encrypted cards, list an index, and fetch selected content." href="/docs/workflows/memory" />
+  <Card title="Perception" description="Report current signals and upload encrypted photo content." href="/docs/workflows/perception" />
+</Cards>
+
+All examples use placeholders. Never copy example ciphertext, nonces, wrapped
+keys, or credentials into a real integration. Generate envelope values with the
+Feedling client encryption implementation.
+
+## Shared encrypted envelope
+
+Chat, Memory, and sensitive Perception payloads reuse a versioned envelope:
+
+```json
+{
+  "v": 1,
+  "id": "CLIENT_GENERATED_UNIQUE_ID",
+  "body_ct": "BASE64_CIPHERTEXT",
+  "nonce": "BASE64_NONCE",
+  "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+  "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+  "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+  "visibility": "shared",
+  "owner_user_id": "usr_0123456789abcdef"
+}
+```
+
+`shared` content requires `K_enclave` so the trusted decrypt service can read it
+for agent workflows. `local_only` omits `K_enclave`; the service can store the
+record but agent-side read paths cannot decrypt its body. `owner_user_id` must
+match the authenticated account on operations that validate ownership.
+
+Envelope bodies remain ciphertext in the main API process. Some read-side
+operations forward authorized candidates to the enclave and return a limited
+decrypted projection. Read each workflow's privacy notes before choosing an
+endpoint.

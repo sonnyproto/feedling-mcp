@@ -1,0 +1,243 @@
+---
+title: API key lifecycle
+description: Register, issue additional keys, recover access, and understand today's revocation limits.
+---
+
+There is no separate approval form or developer dashboard. A client obtains its
+first user API key by registering an account. Additional-device and recovery
+flows can issue more keys for that same account.
+
+> Feedling does not currently expose a public per-key rotation, inventory, or
+> revocation endpoint. Issuing a new key does **not** disable an old key. Plan
+> operational key handling around this limitation.
+
+## Obtain the first key
+
+Call the unauthenticated registration endpoint. `public_key` should be the
+base64 encoding of a newly generated 32-byte X25519 content-encryption public
+key. Keep the matching private key on the device. An empty public key can create
+an account, but encrypted hosted workflows and keypair recovery will not work
+correctly, so production clients should always provide one.
+
+```http
+POST /v1/users/register HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+
+{
+  "public_key": "BASE64_32_BYTE_X25519_PUBLIC_KEY",
+  "archive_language": "en",
+  "access_mode": "model_api",
+  "label": "Primary iPhone"
+}
+```
+
+`access_mode` is one of `resident`, `model_api`, or `official_import`.
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "user_id": "usr_0123456789abcdef",
+  "principal_id": "prn_...",
+  "api_key": "NEW_RAW_API_KEY"
+}
+```
+
+The raw `api_key` is returned in this response. The service persists a one-way
+HMAC-derived key value, not a recoverable copy of the raw key. Store the response
+in the platform credential store before leaving the registration flow. Never
+retry registration merely because the client lost the response: retrying can
+create a second account unless the same content public key allows the server to
+detect the existing account and return `409 account_exists_for_key`.
+
+Confirm the stored key before continuing:
+
+```bash
+curl https://api.feedling.app/v1/users/whoami \
+  -H 'X-API-Key: NEW_RAW_API_KEY'
+```
+
+## Issue a key to another device
+
+The authenticated device first creates a short-lived, one-time link token:
+
+```http
+POST /v1/access/link-token HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: CURRENT_API_KEY
+
+{
+  "access_mode": "model_api",
+  "label": "MacBook"
+}
+```
+
+This operation requires `X-API-Key`; a scoped runtime token is rejected so it
+cannot be exchanged for a long-lived user credential.
+
+```json
+{
+  "token": "flt_ONE_TIME_BEARER_TOKEN",
+  "token_id": "flt_...",
+  "access_mode": "model_api",
+  "route": "model_api",
+  "label": "MacBook",
+  "expires_at": "2026-07-13T18:15:00",
+  "expires_in_seconds": 900,
+  "claim_endpoint": "/v1/access/claim-token"
+}
+```
+
+The default lifetime is 15 minutes, but clients must use the returned
+`expires_at` or `expires_in_seconds` because deployments can configure it.
+Transfer the token only over a protected channel. Anyone holding it before it is
+claimed can obtain a key for the account.
+
+The new device consumes the token without an existing API key. `public_key` is
+optional here and only backfills an account that does not already have one; it
+does not replace an existing content key. A device that needs to decrypt the
+same account data must already have secure access to the matching private key.
+
+```http
+POST /v1/access/claim-token HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+
+{
+  "token": "flt_ONE_TIME_BEARER_TOKEN",
+  "label": "MacBook",
+  "public_key": "SAME_ACCOUNT_BASE64_CONTENT_PUBLIC_KEY",
+  "archive_language": "en",
+  "make_active": true
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "status": "connected",
+  "user_id": "usr_0123456789abcdef",
+  "principal_id": "prn_...",
+  "api_key": "ADDITIONAL_RAW_API_KEY",
+  "access_mode": "model_api",
+  "route": "model_api",
+  "active_route": "model_api",
+  "key_id": "key_..."
+}
+```
+
+A link token can be used once. Reuse returns `409 token_already_used`; an
+expired token returns `410 token_expired`. The returned API key is an additional
+live credential, not a replacement for the key that created the link token.
+
+## Recover with the content keypair
+
+Recovery proves possession of the private key matching the content public key.
+It restores access to the existing account; it does not create a new account.
+
+First request a challenge:
+
+```http
+POST /v1/account/recover/challenge HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+
+{
+  "public_key": "BASE64_32_BYTE_X25519_PUBLIC_KEY"
+}
+```
+
+```json
+{
+  "challenge_id": "rec_...",
+  "envelope": {
+    "v": 1,
+    "id": "...",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_WRAPPED_KEY",
+    "visibility": "local_only",
+    "owner_user_id": "usr_0123456789abcdef"
+  }
+}
+```
+
+Decrypt `envelope` locally with the matching private key, then submit the
+plaintext challenge string:
+
+```http
+POST /v1/account/recover/verify HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+
+{
+  "challenge_id": "rec_...",
+  "answer": "DECRYPTED_CHALLENGE"
+}
+```
+
+```json
+{
+  "user_id": "usr_0123456789abcdef",
+  "principal_id": "prn_...",
+  "api_key": "RECOVERED_RAW_API_KEY",
+  "public_key": "BASE64_32_BYTE_X25519_PUBLIC_KEY"
+}
+```
+
+Challenges expire after five minutes and are consumed on the first verification
+attempt, including a failed answer. Request a new challenge after any failure.
+Recovery issues another live API key and does not revoke keys issued previously.
+
+## Rotation and revocation status
+
+| Operation | Available today? | Effect |
+| --- | --- | --- |
+| Issue an additional key | Yes | Link-token claim or keypair recovery adds a live key. |
+| Replace a key without downtime | Partially | Deploy and verify a new key, but the old key remains valid. |
+| List individual keys | No public endpoint | Access-mode views expose counts, not raw key inventory or full key management. |
+| Revoke one key | No public endpoint | A lost or leaked key cannot currently be disabled independently through the public API. |
+| Invalidate every key | Yes, destructive | Account reset deletes the account and all associated user data. |
+
+For a planned credential change, issue a new key, update every authorized client,
+and verify `/v1/users/whoami`. This is a rollover, not a completed security
+rotation, because the prior credential is still accepted.
+
+If a key is believed to be compromised, the only public operation that
+guarantees all existing keys stop authenticating is a destructive account reset:
+
+```http
+POST /v1/account/reset HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: CURRENT_API_KEY
+
+{
+  "confirm": "delete-all-data"
+}
+```
+
+Account reset is also API-key-only. A hosted runtime token cannot delete the
+account or invalidate its long-lived credentials.
+
+Account reset deletes the account's chat, memory, identity, keys, and other
+user-scoped data. It is not a normal rotation mechanism and is not reversible.
+Do not call it automatically in response to an ordinary `401`.
+
+## Storage checklist
+
+- Use the iOS Keychain, Android Keystore, or an OS-managed secret store for
+  installed clients.
+- Use a deployment secret manager for server integrations; do not bake keys into
+  images or repository variables visible to untrusted jobs.
+- Redact `X-API-Key`, `X-Feedling-Runtime-Token`, link tokens, and recovery
+  answers at the first logging boundary.
+- Give each device its own issued key where possible. Even before per-key
+  revocation exists, this avoids copying one raw secret between systems.
+- Clear credentials entered into the [API playground](/docs/authentication#playground-credential-storage)
+  after testing.

@@ -4,7 +4,13 @@
     "index",
     "getting-started",
     "authentication",
+    "api-keys",
+    "workflows",
+    "reliability",
     "errors",
-    "api-reference"
+    "api-reference",
+    "versioning",
+    "changelog",
+    "self-hosting"
   ]
 }

@@ -16,6 +16,23 @@ from asgi.settings import _origins  # noqa: E402
 
 DOCS_ORIGIN = "https://docs.feedling.app"
 UNTRUSTED_ORIGIN = "https://malicious.example"
+PLAYGROUND_REQUEST_HEADERS = (
+    "authorization",
+    "content-type",
+    "if-none-match",
+    "range",
+    "x-api-key",
+    "x-byte-end",
+    "x-byte-start",
+    "x-ciphertext-sha256",
+    "x-content-sha256",
+    "x-envelope-meta",
+    "x-feedling-consumer",
+    "x-feedling-consumer-commit",
+    "x-feedling-consumer-id",
+    "x-feedling-consumer-version",
+    "x-feedling-runtime-token",
+)
 
 
 def _request(method: str, path: str, *, headers: dict[str, str] | None = None):
@@ -39,26 +56,29 @@ def _preflight(origin: str, method: str, request_headers: str):
     )
 
 
-def test_docs_origin_preflight_allows_playground_methods_and_auth_headers():
+def test_docs_origin_preflight_allows_playground_methods_and_contract_headers():
     for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
         response = _preflight(
             DOCS_ORIGIN,
             method,
-            "content-type, x-api-key, x-feedling-runtime-token",
+            ", ".join(PLAYGROUND_REQUEST_HEADERS),
         )
 
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == DOCS_ORIGIN
         assert method in response.headers["access-control-allow-methods"]
         allowed_headers = response.headers["access-control-allow-headers"].lower()
-        assert "content-type" in allowed_headers
-        assert "x-api-key" in allowed_headers
-        assert "x-feedling-runtime-token" in allowed_headers
+        for header in PLAYGROUND_REQUEST_HEADERS:
+            assert header in allowed_headers
         assert "access-control-allow-credentials" not in response.headers
 
 
 def test_untrusted_origin_preflight_is_rejected():
-    response = _preflight(UNTRUSTED_ORIGIN, "GET", "x-api-key")
+    response = _preflight(
+        UNTRUSTED_ORIGIN,
+        "GET",
+        ", ".join(PLAYGROUND_REQUEST_HEADERS),
+    )
 
     assert response.status_code == 400
     assert "access-control-allow-origin" not in response.headers
@@ -73,6 +93,9 @@ def test_auth_error_is_readable_by_docs_origin_without_bypassing_auth():
 
     assert response.status_code == 401
     assert response.headers["access-control-allow-origin"] == DOCS_ORIGIN
+    exposed_headers = response.headers["access-control-expose-headers"].lower()
+    assert "accept-ranges" in exposed_headers
+    assert "content-range" in exposed_headers
 
 
 def test_non_browser_request_is_unchanged():

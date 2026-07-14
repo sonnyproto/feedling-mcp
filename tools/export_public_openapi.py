@@ -16,6 +16,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .public_openapi_contracts import apply_public_contracts
+else:
+    from public_openapi_contracts import apply_public_contracts
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
@@ -29,20 +34,34 @@ EXCLUDED_PREFIXES = (
     "/v1/debug",
 )
 
-PUBLIC_PATHS = {
-    "/healthz",
-    "/v1/access/claim-token",
-    "/v1/account/recover/challenge",
-    "/v1/account/recover/verify",
-    "/v1/users/register",
+EXCLUDED_OPERATIONS = {
+    # Operator-only writer guarded by FEEDLING_ADMIN_TOKEN.  The public GET on
+    # the same path is intentionally retained, so exposure must be per method.
+    ("post", "/v1/copytext"),
+    # User-authenticated implementation diagnostics, not a product API.
+    ("get", "/v1/proactive/debug"),
 }
 
-# These control-plane operations intentionally reject runtime tokens, even when
-# the token belongs to the same user.
-API_KEY_ONLY_PATHS = {
-    "/v1/mcp/servers",
-    "/v1/mcp/servers/{name}",
-    "/v1/mcp/servers/{name}/test",
+PUBLIC_OPERATIONS = {
+    ("get", "/healthz"),
+    ("post", "/v1/access/claim-token"),
+    ("post", "/v1/account/recover/challenge"),
+    ("post", "/v1/account/recover/verify"),
+    ("post", "/v1/users/register"),
+    ("get", "/v1/copytext"),
+}
+
+# These operations intentionally reject runtime tokens. Perception report is
+# API-key-only until sensitive-signal credentials are forwarded to the enclave.
+API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/access/link-token"),
+    ("post", "/v1/account/reset"),
+    ("get", "/v1/mcp/servers"),
+    ("post", "/v1/mcp/servers"),
+    ("patch", "/v1/mcp/servers/{name}"),
+    ("delete", "/v1/mcp/servers/{name}"),
+    ("post", "/v1/mcp/servers/{name}/test"),
+    ("post", "/v1/perception/report"),
 }
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
@@ -123,21 +142,26 @@ def _build_public_schema(schema: dict[str, Any]) -> dict[str, Any]:
             continue
 
         tag = _tag_for_path(path)
-        used_tags.add(tag)
         rendered_item: dict[str, Any] = {}
         for key, value in path_item.items():
             if key.lower() not in HTTP_METHODS or not isinstance(value, dict):
                 rendered_item[key] = value
                 continue
 
+            operation_key = (key.lower(), path)
+            if operation_key in EXCLUDED_OPERATIONS:
+                continue
+
             operation = dict(value)
             operation["tags"] = [tag]
-            if path in PUBLIC_PATHS:
+            if operation_key in PUBLIC_OPERATIONS:
                 operation["security"] = []
-            elif path in API_KEY_ONLY_PATHS:
+            elif operation_key in API_KEY_ONLY_OPERATIONS:
                 operation["security"] = [{"ApiKeyAuth": []}]
             rendered_item[key] = operation
-        paths[path] = rendered_item
+            used_tags.add(tag)
+        if any(key.lower() in HTTP_METHODS for key in rendered_item):
+            paths[path] = rendered_item
 
     components = dict(schema.get("components", {}))
     security_schemes = dict(components.get("securitySchemes", {}))
@@ -159,11 +183,11 @@ def _build_public_schema(schema: dict[str, Any]) -> dict[str, Any]:
     )
     components["securitySchemes"] = security_schemes
 
-    return {
+    public_schema = {
         "openapi": schema.get("openapi", "3.1.0"),
         "info": {
             "title": "Feedling API",
-            "version": "1.0.0",
+            "version": "v1",
             "description": (
                 "HTTP API for Feedling accounts, encrypted chat, agent memory, "
                 "model routing, perception, and proactive experiences."
@@ -182,6 +206,7 @@ def _build_public_schema(schema: dict[str, Any]) -> dict[str, Any]:
         "paths": paths,
         "components": components,
     }
+    return apply_public_contracts(public_schema)
 
 
 def main() -> None:

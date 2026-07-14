@@ -1,0 +1,67 @@
+---
+title: Versioning and deprecation
+description: Understand Feedling's current compatibility boundary and deprecation signals.
+---
+
+## Current version boundary
+
+Public application routes live under `/v1`. That path segment is the API's major
+compatibility boundary. The OpenAPI document uses `info.version: v1` as the same
+published major-contract label. It is not SemVer, a build SHA, a deployment
+identifier, a separate request header, or a way to select different server
+behavior.
+
+Feedling does not currently offer date-pinned API versions, a client-selected
+version header, or parallel minor versions. Clients should send requests to the
+documented `/v1` path and tolerate additive response changes.
+
+## Compatibility rules
+
+The project uses the following change discipline for the public contract:
+
+| Change | Treatment |
+| --- | --- |
+| Add an optional request field | May ship within `/v1`. |
+| Add a response field or a new endpoint | May ship within `/v1`; clients must ignore unknown fields. |
+| Add a new enum value | May ship within `/v1`; clients should preserve or safely handle unknown values rather than crash. |
+| Make an optional field required, remove or rename a field, or change its meaning | Breaking; should use a new major path or an announced migration. |
+| Change authentication or authorization requirements | Breaking unless required to close an active security issue. |
+| Tighten validation to reject behavior that was never documented | Can occur within `/v1`, with a changelog note when it affects known clients. |
+| Emergency security or privacy correction | Can take effect without the normal notice process. |
+
+“Should” here describes project change discipline, not a contractual uptime or
+support SLA. The service does not yet publish a formal minimum support duration
+for `/v1`.
+
+## Deprecation process
+
+The current public OpenAPI snapshot has no operations marked `deprecated`. The
+service also does not currently guarantee `Deprecation` or `Sunset` response
+headers, and there is no fixed 30-, 60-, or 90-day removal window.
+
+When a public operation is deprecated, the intended communication sequence is:
+
+1. Mark the operation or field as deprecated in the OpenAPI contract where the
+   format permits it.
+2. Add an entry to the [public changelog](/docs/changelog) with the replacement
+   and migration steps.
+3. Publish a removal date if one has actually been committed. If no date is
+   stated, clients must not infer one.
+4. Remove the behavior only in a new major version or after the announced
+   migration, except for urgent security and privacy corrections.
+
+This documentation is the source for public deprecation status. Internal design
+notes, repository TODOs, and dormant compatibility code are not deprecation
+notices.
+
+## Client compatibility checklist
+
+- Ignore unknown JSON fields and preserve unknown enum values when possible.
+- Branch on machine-readable `error` values, not `detail` text.
+- Do not depend on JSON property order, undocumented defaults, or legacy
+  query-string authentication.
+- Pin a generated client to a reviewed OpenAPI snapshot and review diffs before
+  upgrading it.
+- Monitor the [changelog](/docs/changelog) and the operation's API reference.
+- Test against Staging before changing a production client, while remembering
+  that Staging data and capacity are separate from Production.

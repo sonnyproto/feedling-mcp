@@ -7,6 +7,7 @@ on:
       - 'backend/**'
       - 'docs-site/**'
       - 'tools/export_public_openapi.py'
+      - 'tools/public_openapi_contracts.py'
       - '.github/workflows/docs-site.yml'
   pull_request:
     branches: [main, test]
@@ -14,6 +15,7 @@ on:
       - 'backend/**'
       - 'docs-site/**'
       - 'tools/export_public_openapi.py'
+      - 'tools/public_openapi_contracts.py'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:
 

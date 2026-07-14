@@ -5,9 +5,9 @@ user (``Depends(require_auth)`` — the ASGI equivalent of ``auth.require_user()
 and delegates to the framework-neutral ``perception.perception_read_core`` so the
 response bodies are byte-identical to Flask's.
 
-Auth/scope: the Flask routes gate on ``auth.require_user()`` only — none call
-``runtime_auth.authorize_scope(...)`` — so there is deliberately NO
-``require_scope`` here; adding one would diverge from the Flask surface.
+Auth/scope: read routes accept either authenticated credential. ``/report`` is
+API-key-only because the sensitive-signal decrypt adapter forwards API-key
+material and cannot safely complete the same flow with a runtime token alone.
 
 E2E boundary: perception signals/photos are v1 E2E envelopes, never decrypted in
 this process except via the enclave. ``/report`` writes encrypted perception and,
@@ -30,14 +30,14 @@ from fastapi.responses import JSONResponse
 from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
-from asgi.deps import require_auth
+from asgi.deps import require_api_key, require_auth
 from perception import perception_read_core
 
 router = APIRouter()
 
 
 @router.post("/v1/perception/report")
-async def report(request: Request, auth: AuthResult = Depends(require_auth)):
+async def report(request: Request, auth: AuthResult = Depends(require_api_key)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     body, status = await threadpool.run_db(
         perception_read_core.report,

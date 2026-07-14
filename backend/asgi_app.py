@@ -84,10 +84,27 @@ if settings.cors_allowed_origins:
         allow_headers=[
             "Authorization",
             "Content-Type",
+            "If-None-Match",
+            "Range",
             "X-API-Key",
+            "X-Byte-End",
+            "X-Byte-Start",
+            "X-Ciphertext-SHA256",
+            "X-Content-SHA256",
+            "X-Envelope-Meta",
+            "X-Feedling-Consumer",
+            "X-Feedling-Consumer-Commit",
+            "X-Feedling-Consumer-Id",
+            "X-Feedling-Consumer-Version",
             "X-Feedling-Runtime-Token",
         ],
-        expose_headers=["Content-Disposition", "ETag", "X-Request-Id"],
+        expose_headers=[
+            "Accept-Ranges",
+            "Content-Disposition",
+            "Content-Range",
+            "ETag",
+            "X-Request-Id",
+        ],
         max_age=600,
     )
 

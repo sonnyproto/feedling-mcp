@@ -6,15 +6,23 @@ description: Public Feedling endpoints generated from the FastAPI application.
 The endpoint pages in this section are generated from a filtered OpenAPI snapshot
 of the production FastAPI application.
 
-- Operator-only `/admin` and `/debug` routes are excluded.
+- Operator-only routes and methods are excluded, including `/admin`, `/debug`,
+  and operator-only writers that share a path with a public read operation.
 - Production `/docs`, `/redoc`, and `/openapi.json` remain disabled.
 - End-user requests normally use `X-API-Key`; hosted runtimes use scoped tokens in
   `X-Feedling-Runtime-Token`.
 - The browser playground sends requests directly to the selected Production or
   Staging server. Protected endpoints still require a valid credential.
+- Authentication headers are represented by the operation's security scheme.
+  Endpoint-specific query and non-authentication header parameters appear in
+  the request controls below each operation.
 - Browser access is restricted to the documentation site's exact origin; CORS
   does not bypass API-key or runtime-token authorization.
 - Check the selected server before pressing **Send**. Requests sent to Production
   operate on the authenticated account's live data.
 
 Browse **Endpoints** in the sidebar to inspect routes grouped by domain.
+
+The reference describes individual HTTP operations. See the [workflow
+guides](/docs/workflows) for complete multi-request examples and
+[reliability](/docs/reliability) for retry and pagination rules.

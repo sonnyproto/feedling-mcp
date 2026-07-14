@@ -1,0 +1,330 @@
+---
+title: Chat workflow
+description: Send hosted messages or run the encrypted resident consumer loop.
+---
+
+Feedling exposes two chat paths with different responsibilities.
+
+| Path | Use it when | Who encrypts the user message? |
+| --- | --- | --- |
+| `POST /v1/model_api/chat/send` | A user-facing client sends a turn to a configured hosted agent runtime. | Feedling builds the envelope for the registered user. |
+| `/v1/chat/message` → `/v1/chat/poll` → `/v1/chat/response` | You operate an independent resident consumer. | The posting client and resident consumer build envelopes. |
+
+The hosted path is asynchronous. A successful send is always `202`, even when
+the assistant ciphertext is already available. It never returns a plaintext
+assistant reply.
+
+## Hosted chat
+
+Before sending, the account needs a content public key, a configured model route,
+and a live hosted runtime. Configuration or supervisor failures are returned
+before the user message is stored where possible.
+
+### 1. Send the turn
+
+At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
+limited to 12,000 characters. `context_refs` accepts at most eight references;
+currently memory references are the useful public form.
+
+```http
+POST /v1/model_api/chat/send HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "message": "Use the selected memory to help me plan tomorrow.",
+  "context_refs": [
+    {
+      "type": "memory",
+      "id": "mom_7f20d39af321",
+      "title": "Morning routine"
+    }
+  ]
+}
+```
+
+For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
+2,000,000 bytes and the supported MIME types are JPEG, PNG, WebP, and GIF.
+
+```json
+{
+  "message": "What should I notice in this image?",
+  "image_b64": "BASE64_IMAGE_BYTES",
+  "image_mime": "image/jpeg",
+  "context_refs": []
+}
+```
+
+For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
+file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
+files are accepted. Send only one binary attachment per turn.
+
+```json
+{
+  "message": "Summarize this contract.",
+  "file_b64": "BASE64_FILE_BYTES",
+  "file_name": "contract.pdf",
+  "file_mime": "application/pdf",
+  "context_refs": []
+}
+```
+
+### 2. Handle the asynchronous response
+
+If the agent has not responded within the server's short wait window, the
+response has no `assistant_message`:
+
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{
+  "status": "processing",
+  "reply_ready": false,
+  "user_message": {
+    "id": "msg_user_123",
+    "ts": 1783978500.125
+  },
+  "runtime": {
+    "engine": "feedling_agent_runtime",
+    "mode": "hosted_agent",
+    "driver": "codex",
+    "version": 1
+  }
+}
+```
+
+If it arrived during that window, the status is still `202 processing`; the
+response adds only a reference to the encrypted assistant message:
+
+```json
+{
+  "status": "processing",
+  "reply_ready": true,
+  "user_message": {
+    "id": "msg_user_123",
+    "ts": 1783978500.125
+  },
+  "assistant_message": {
+    "id": "msg_assistant_456",
+    "ts": 1783978502.75
+  },
+  "runtime": {
+    "engine": "feedling_agent_runtime",
+    "mode": "hosted_agent",
+    "driver": "codex",
+    "version": 1
+  }
+}
+```
+
+Do not look for a `reply` text field. If `assistant_message.id` is present, fetch
+that message directly:
+
+```http
+GET /v1/chat/messages/msg_assistant_456/body HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+Otherwise advance the transcript with the user message timestamp:
+
+```http
+GET /v1/chat/history?since=1783978500.125&limit=50&include_image_body=false HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "messages": [
+    {
+      "v": 1,
+      "id": "msg_assistant_456",
+      "role": "openclaw",
+      "sender": "assistant",
+      "source": "model_api",
+      "content_type": "text",
+      "ts": 1783978502.75,
+      "body_ct": "BASE64_CIPHERTEXT",
+      "nonce": "BASE64_NONCE",
+      "K_user": "BASE64_WRAPPED_KEY",
+      "K_enclave": "BASE64_WRAPPED_KEY",
+      "visibility": "shared",
+      "owner_user_id": "usr_0123456789abcdef",
+      "content": "",
+      "is_from_openclaw": true
+    }
+  ],
+  "total": 42,
+  "oldest_ts": 1783978502.75,
+  "latest_ts": 1783978502.75,
+  "has_more_older": true,
+  "has_more_newer": false,
+  "bodies_omitted": 0,
+  "image_bodies_omitted": 0,
+  "body_omit_inline_max": 262144
+}
+```
+
+Decrypt `body_ct` on the authorized client. When a history item has
+`body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
+assuming the message is empty.
+
+## Independent resident loop
+
+The resident path is a queue-and-reply protocol. It does not accept plaintext
+message bodies.
+
+### 1. The client stores a user message
+
+Encrypt the user text or attachment and post the complete envelope:
+
+```http
+POST /v1/chat/message HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "envelope": {
+    "v": 1,
+    "id": "env_user_123",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "content_type": "text"
+}
+```
+
+For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
+
+```json
+{
+  "id": "msg_user_123",
+  "ts": 1783978500.125,
+  "v": 1
+}
+```
+
+### 2. The resident consumer long-polls and claims work
+
+Use a stable consumer ID on every poll and response. `claim=true` is the default
+and prevents healthy consumers from processing the same turn concurrently.
+
+```http
+GET /v1/chat/poll?since=1783978400&timeout=30&claim=true HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+X-Feedling-Consumer: feedling-chat-resident
+X-Feedling-Consumer-Id: resident-macbook-01
+X-Feedling-Consumer-Version: 1.4.0
+X-Feedling-Consumer-Commit: abc1234
+```
+
+```json
+{
+  "messages": [
+    {
+      "v": 1,
+      "id": "msg_user_123",
+      "role": "user",
+      "source": "chat",
+      "content_type": "text",
+      "ts": 1783978500.125,
+      "body_ct": "BASE64_CIPHERTEXT",
+      "nonce": "BASE64_NONCE",
+      "K_user": "BASE64_WRAPPED_KEY",
+      "K_enclave": "BASE64_WRAPPED_KEY",
+      "visibility": "shared",
+      "owner_user_id": "usr_0123456789abcdef"
+    }
+  ],
+  "runtime_v2": {},
+  "client_release": {
+    "expected_consumer_commit": "abc1234"
+  },
+  "user_mcp": {
+    "fingerprint": "..."
+  },
+  "timed_out": false,
+  "consumer_id": "resident-macbook-01",
+  "claimed": true
+}
+```
+
+An empty long poll is a successful `200` with `messages: []` and
+`timed_out: true`. Immediately start the next poll; do not treat it as an error.
+The requested timeout is capped at 60 seconds.
+
+### 3. The consumer posts the encrypted reply
+
+Decrypt the claimed user turn through the authorized enclave path, invoke the
+agent, then encrypt its reply. `reply_to_message_id` connects the two records and
+enables duplicate-reply protection.
+
+```http
+POST /v1/chat/response HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+X-Feedling-Consumer: feedling-chat-resident
+X-Feedling-Consumer-Id: resident-macbook-01
+X-Feedling-Consumer-Version: 1.4.0
+X-Feedling-Consumer-Commit: abc1234
+
+{
+  "envelope": {
+    "v": 1,
+    "id": "env_assistant_456",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "content_type": "text",
+  "source": "chat",
+  "reply_to_message_id": "msg_user_123"
+}
+```
+
+```json
+{
+  "id": "msg_assistant_456",
+  "ts": 1783978502.75,
+  "v": 1
+}
+```
+
+If another consumer already answered the same user message, the endpoint can
+return `409 already_answered`. Treat that response as a lost race and do not post
+a second assistant turn. A network failure after sending is ambiguous because
+Chat does not support `Idempotency-Key`; check history or the parent message's
+reply metadata before deciding whether to retry.
+
+## Destructive transcript clear
+
+Clearing Chat requires an explicit body even though the method is `DELETE`:
+
+```http
+DELETE /v1/chat/history HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "confirm": "clear-chat-history"
+}
+```
+
+This clears the authenticated user's transcript only. It does not delete Memory,
+Identity, API keys, or the account.
