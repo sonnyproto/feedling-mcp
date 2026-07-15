@@ -1369,6 +1369,136 @@ def test_cleanup_resets_every_account_and_removes_manifest(tmp_path):
     assert not manifest_path.exists()
 
 
+def test_cleanup_never_unlinks_manifest_replaced_after_snapshot(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": [
+                    {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"}
+                ],
+            }
+        )
+    )
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("replacement-must-survive", encoding="utf-8")
+
+    def reset_and_replace(_client, _entry, _admin_client=None):
+        replacement.replace(manifest_path)
+        return True
+
+    monkeypatch.setattr(provisioner, "_reset_one", reset_and_replace)
+
+    result = provisioner.cleanup(manifest_path, client=FakeSmokeClient())
+
+    assert result["attempted"] == 1
+    assert result["cleaned"] == 1
+    assert result["failed_profile_ids"] == [
+        provisioner.MANIFEST_CLEANUP_FAILURE_ID
+    ]
+    assert result["manifest_deleted"] is False
+    assert result["manifest_delete_failure"] == "manifest_path_identity_changed"
+    assert manifest_path.read_text(encoding="utf-8") == "replacement-must-survive"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (
+            '{"schema_version":1,"base_url":"https://test-api.feedling.app",'
+            '"profiles":[],"profiles":[]}'
+        ),
+        (
+            '{"schema_version":1,"base_url":"https://test-api.feedling.app",'
+            '"profiles":[],"unexpected":NaN}'
+        ),
+    ],
+    ids=["duplicate-key", "nan"],
+)
+def test_cleanup_rejects_non_strict_manifest_json_before_reset(tmp_path, raw):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(raw, encoding="utf-8")
+    smoke = FakeSmokeClient()
+
+    with pytest.raises(provisioner.ProvisionError, match="manifest is unreadable"):
+        provisioner.cleanup(manifest_path, client=smoke)
+
+    assert smoke.reset_calls == []
+    assert manifest_path.read_text(encoding="utf-8") == raw
+
+
+def test_cleanup_manifest_snapshot_keeps_manifest_after_partial_cleanup(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "base_url": provisioner.ALLOWED_BASE_URL,
+        "profiles": [
+            {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+            {"profile_id": "p2", "user_id": "u2", "api_key": "account-2"},
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    metadata = manifest_path.stat()
+    smoke = FakeSmokeClient()
+    smoke.reset_fail_for.add("account-2")
+
+    result = provisioner.cleanup_manifest_snapshot(
+        manifest,
+        manifest_path=manifest_path,
+        manifest_identity=(metadata.st_dev, metadata.st_ino),
+        client=smoke,
+    )
+
+    assert result == {
+        "attempted": 2,
+        "cleaned": 1,
+        "failed_profile_ids": ["p2"],
+        "manifest_deleted": False,
+        "manifest_missing": False,
+    }
+    assert manifest_path.exists()
+
+
+def test_cleanup_manifest_snapshot_can_checkpoint_success_before_unlink(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "base_url": provisioner.ALLOWED_BASE_URL,
+        "profiles": [
+            {"profile_id": "p1", "user_id": "u1", "api_key": "account-1"},
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    metadata = manifest_path.stat()
+
+    result = provisioner.cleanup_manifest_snapshot(
+        manifest,
+        manifest_path=manifest_path,
+        manifest_identity=(metadata.st_dev, metadata.st_ino),
+        client=FakeSmokeClient(),
+        delete_manifest=False,
+    )
+
+    assert result == {
+        "attempted": 1,
+        "cleaned": 1,
+        "failed_profile_ids": [],
+        "manifest_deleted": False,
+        "manifest_missing": False,
+        "manifest_retained": True,
+    }
+    assert manifest_path.exists()
+    assert (
+        provisioner.unlink_manifest_snapshot(
+            manifest_path, (metadata.st_dev, metadata.st_ino)
+        )
+        is None
+    )
+    assert manifest_path.exists() is False
+
+
 def test_adminless_diagnostic_cleanup_needs_no_admin_token(tmp_path):
     manifest_path = tmp_path / "diagnostic.json"
     manifest_path.write_text(
@@ -1698,3 +1828,376 @@ def test_cleanup_cli_emits_machine_readable_sanitized_summary(tmp_path, capsys):
         "failed_profile_ids": [],
         "manifest_deleted": False,
     }
+
+
+@pytest.mark.parametrize("count", [1, 8, 24])
+def test_provision_pool_creates_strict_same_route_accounts(tmp_path, count):
+    from qa.regression.live_accounts import load_account_pool
+
+    coverage = _write_coverage(tmp_path)
+    manifest_path = tmp_path / "pool.json"
+    profile_id = "official-openai"
+    selected_spec = provisioner.PROFILE_SPECS[profile_id]
+    env = _env()
+    for other_id, other_spec in provisioner.PROFILE_SPECS.items():
+        if other_id == profile_id:
+            continue
+        env.pop(other_spec.model_env, None)
+        if other_spec.credential_env != selected_spec.credential_env:
+            env.pop(other_spec.credential_env, None)
+        if other_spec.base_url_env:
+            env.pop(other_spec.base_url_env, None)
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient(smoke)
+
+    result = provisioner.provision_pool(
+        coverage,
+        manifest_path,
+        profile_id=profile_id,
+        count=count,
+        env=env,
+        client=smoke,
+        admin_client=admin,
+    )
+
+    assert provisioner._complete_pool_manifest(result) is True
+    assert result["manifest_kind"] == "persona_memory_account_pool"
+    assert result["pool_profile_id"] == profile_id
+    assert result["pool_count"] == count
+    assert result["auxiliary_accounts"] == []
+    assert len(result["profiles"]) == count
+    assert len(smoke.registered) == count
+    assert len(smoke.setup_calls) == count * 2
+    assert len(smoke.trace_calls) == count
+    assert len(smoke.runtime_calls) == count
+    assert len(admin.calls) == 1 + count * 3
+    assert [row["pool_index"] for row in result["profiles"]] == list(
+        range(1, count + 1)
+    )
+    assert {row["profile_id"] for row in result["profiles"]} == {profile_id}
+    assert len({row["label"] for row in result["profiles"]}) == count
+    assert len({row["user_id"] for row in result["profiles"]}) == count
+    assert len({row["api_key"] for row in result["profiles"]}) == count
+    assert len(
+        {
+            row["synthetic_account_lease"]["lease_id"]
+            for row in result["profiles"]
+        }
+    ) == count
+    assert all(
+        row["provider"] == selected_spec.provider
+        and row["configured_model"] == VALID_MODELS[profile_id]
+        and row["configured_base_url"] == selected_spec.expected_configured_base_url
+        and row["runtime_mode"] == provisioner.RUNTIME_V2_REQUIREMENT
+        and row["runtime_version"] == provisioner.RUNTIME_V2_VERSION
+        and row["provision_status"] == provisioner.PROVISION_STATUS_READY
+        for row in result["profiles"]
+    )
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+    live_pool = load_account_pool(manifest_path)
+    assert len(live_pool.rows) == count
+    assert live_pool.profile_id == profile_id
+    raw = manifest_path.read_text()
+    assert env[selected_spec.credential_env] not in raw
+    assert env["QA_TEST_ADMIN_TOKEN"] not in raw
+
+
+def test_provision_pool_supports_strict_baseline_runtime(tmp_path):
+    from qa.regression.live_accounts import load_account_pool
+
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient(smoke)
+    manifest_path = tmp_path / "pool.json"
+
+    result = provisioner.provision_pool(
+        _write_coverage(tmp_path),
+        manifest_path,
+        profile_id="official-gemini",
+        count=2,
+        env=_env(),
+        client=smoke,
+        admin_client=admin,
+        runtime_requirement=provisioner.BASELINE_RUNTIME_REQUIREMENT,
+    )
+
+    assert provisioner._complete_pool_manifest(result) is True
+    assert result["runtime_mode"] == provisioner.BASELINE_RUNTIME_REQUIREMENT
+    assert admin.modes == {}
+    assert all(
+        row["runtime_mode"] == provisioner.DIAGNOSTIC_RUNTIME_MODE
+        and row["runtime_version"] == provisioner.DIAGNOSTIC_RUNTIME_VERSION
+        and row["runtime_mode_set_required"] is False
+        and row["runtime_mode_set_verified"] is False
+        for row in result["profiles"]
+    )
+    live_pool = load_account_pool(manifest_path)
+    assert live_pool.deployment_runtime == provisioner.BASELINE_RUNTIME_REQUIREMENT
+
+
+@pytest.mark.parametrize("count", [True, 0, -1, 25])
+def test_provision_pool_rejects_invalid_count_before_external_state(tmp_path, count):
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient(smoke)
+
+    with pytest.raises(provisioner.ProvisionError, match="pool count"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            tmp_path / "pool.json",
+            profile_id="official-openai",
+            count=count,
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
+def test_provision_pool_rejects_unknown_profile_before_external_state(tmp_path):
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient(smoke)
+
+    with pytest.raises(provisioner.ProvisionError, match="outside the locked"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            tmp_path / "pool.json",
+            profile_id="unknown-route",
+            count=8,
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
+@pytest.mark.parametrize("unsafe", ["existing", "public-parent", "relative"])
+def test_provision_pool_rejects_unsafe_manifest_path_before_external_state(
+    tmp_path, unsafe
+):
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient(smoke)
+    if unsafe == "existing":
+        manifest = tmp_path / "pool.json"
+        manifest.write_text("occupied", encoding="utf-8")
+    elif unsafe == "public-parent":
+        parent = tmp_path / "public"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+        manifest = parent / "pool.json"
+    else:
+        manifest = Path("relative-pool.json")
+
+    with pytest.raises(provisioner.ProvisionError, match="pool manifest"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest,
+            profile_id="official-openai",
+            count=2,
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
+def test_provision_pool_blocked_account_cleans_entire_pool(tmp_path):
+    smoke = FakeSmokeClient()
+    smoke.reject_valid_for = "user-1"
+    admin = FakeAdminClient(smoke)
+    manifest = tmp_path / "pool.json"
+
+    with pytest.raises(
+        provisioner.ProvisionError,
+        match="pool account provisioning blocked: VALID_KEY_REJECTED",
+    ):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest,
+            profile_id="official-openai",
+            count=3,
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert len(smoke.registered) == 2
+    assert [call[0] for call in smoke.reset_calls] == [
+        "feedling-account-key-0",
+        "feedling-account-key-1",
+    ]
+    assert not manifest.exists()
+
+
+def test_provision_pool_cleanup_failure_retains_aggregate_manifest(tmp_path):
+    smoke = FakeSmokeClient()
+    smoke.reject_valid_for = "user-1"
+    smoke.reset_fail_for.add("feedling-account-key-0")
+    manifest = tmp_path / "pool.json"
+
+    with pytest.raises(provisioner.ProvisionError, match="VALID_KEY_REJECTED"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest,
+            profile_id="official-openai",
+            count=3,
+            env=_env(),
+            client=smoke,
+            admin_client=FakeAdminClient(smoke),
+        )
+
+    assert manifest.exists()
+    persisted = json.loads(manifest.read_text())
+    assert persisted["manifest_kind"] == "persona_memory_account_pool"
+    assert [row["pool_index"] for row in persisted["profiles"]] == [1, 2]
+    assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
+
+
+def test_provision_pool_registration_failure_cleans_prior_accounts(tmp_path):
+    smoke = FakeSmokeClient()
+    smoke.fail_registration_at = 1
+    manifest = tmp_path / "pool.json"
+
+    with pytest.raises(
+        provisioner.ProvisionError,
+        match="pool account registration failed at index: 2",
+    ):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest,
+            profile_id="official-openai",
+            count=3,
+            env=_env(),
+            client=smoke,
+            admin_client=FakeAdminClient(smoke),
+        )
+
+    assert [call[0] for call in smoke.reset_calls] == ["feedling-account-key-0"]
+    assert not manifest.exists()
+
+
+def test_provision_pool_checkpoint_failure_cleans_unpersisted_account(
+    tmp_path, monkeypatch
+):
+    smoke = FakeSmokeClient()
+    manifest_path = tmp_path / "pool.json"
+    original_write = provisioner._atomic_write_manifest
+    injected = False
+
+    def fail_second_account_first_checkpoint(path, manifest):
+        nonlocal injected
+        if len(manifest.get("profiles", [])) == 2 and not injected:
+            injected = True
+            raise OSError("injected checkpoint failure")
+        return original_write(path, manifest)
+
+    monkeypatch.setattr(
+        provisioner, "_atomic_write_manifest", fail_second_account_first_checkpoint
+    )
+
+    with pytest.raises(OSError, match="injected checkpoint failure"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest_path,
+            profile_id="official-openai",
+            count=3,
+            env=_env(),
+            client=smoke,
+            admin_client=FakeAdminClient(smoke),
+        )
+
+    assert injected is True
+    assert len(smoke.registered) == 2
+    assert [call[0] for call in smoke.reset_calls] == [
+        "feedling-account-key-0",
+        "feedling-account-key-1",
+    ]
+    assert not manifest_path.exists()
+
+
+def test_provision_pool_retains_unpersisted_account_when_reset_fails(
+    tmp_path, monkeypatch
+):
+    smoke = FakeSmokeClient()
+    smoke.reset_fail_for.add("feedling-account-key-1")
+    manifest_path = tmp_path / "pool.json"
+    original_write = provisioner._atomic_write_manifest
+    injected = False
+
+    def fail_second_account_first_checkpoint(path, manifest):
+        nonlocal injected
+        if len(manifest.get("profiles", [])) == 2 and not injected:
+            injected = True
+            raise OSError("injected checkpoint failure")
+        return original_write(path, manifest)
+
+    monkeypatch.setattr(
+        provisioner, "_atomic_write_manifest", fail_second_account_first_checkpoint
+    )
+
+    with pytest.raises(OSError, match="injected checkpoint failure"):
+        provisioner.provision_pool(
+            _write_coverage(tmp_path),
+            manifest_path,
+            profile_id="official-openai",
+            count=3,
+            env=_env(),
+            client=smoke,
+            admin_client=FakeAdminClient(smoke),
+        )
+
+    assert manifest_path.is_file()
+    retained = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [row["pool_index"] for row in retained["profiles"]] == [1, 2]
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+
+
+def test_provision_pool_cli_emits_sanitized_summary(tmp_path, monkeypatch, capsys):
+    coverage = _write_coverage(tmp_path)
+    manifest = tmp_path / "pool.json"
+    env = _env()
+    smoke = FakeSmokeClient()
+    original = provisioner.provision_pool
+
+    def injected_pool(coverage_path, manifest_path, **kwargs):
+        return original(
+            coverage_path,
+            manifest_path,
+            env=env,
+            client=smoke,
+            admin_client=FakeAdminClient(smoke),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(provisioner, "provision_pool", injected_pool)
+    exit_code = provisioner.main(
+        [
+            "provision-pool",
+            "--coverage",
+            str(coverage),
+            "--manifest",
+            str(manifest),
+            "--profile",
+            "official-openai",
+            "--count",
+            "2",
+            "--baseline-runtime",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "ok": True,
+        "manifest_kind": "persona_memory_account_pool",
+        "pool_profile_id": "official-openai",
+        "pool_count": 2,
+        "manifest": str(manifest),
+    }
+    assert env["QA_OPENAI_PROVIDER_API_KEY"] not in captured.out
+    assert env["QA_TEST_ADMIN_TOKEN"] not in captured.out

@@ -199,6 +199,66 @@ There is no single public `/readyz` endpoint that proves all of these
 dependencies. Operators should compose synthetic, non-production probes for the
 capabilities they enable and keep `/healthz` as a lightweight liveness signal.
 
+## Formal live persona and memory evaluation
+
+The repository's formal live evaluation is an operator-side release gate, not a
+public API or an extension of `/healthz`. It tests whether a candidate build
+preserves a fixed persona and imported memory source under real multi-turn Chat
+traffic. The formal path has these phases:
+
+1. A trusted outer workflow serializes access to the test deployment and
+   invokes the arm supervisor, which runs `provision-pool`. The default release
+   profile allocates eight one-use synthetic accounts per repetition for three
+   repetitions: 24 accounts for each baseline or candidate arm. The two arms
+   use disjoint pools on the same locked provider route.
+2. `verify-deployment` records the deployed build before execution. A formal
+   arm requires `hosted_resident`: the receipt identifies the expected backend
+   and deployment revisions and shows a homogeneous set of live workers whose
+   reported revision matches the build. `deployed_current` is diagnostic-only
+   because it cannot attribute Persona/chat behavior to a worker revision.
+3. `prepare` imports the same versioned persona and memory-source bundle into
+   every account, performs an authorized decrypt/read-back check, clears the
+   import conversation and trace, and emits a short-lived, content-free
+   readiness receipt. A second worker receipt brackets the completed import.
+   The readiness receipt binds both deployment receipts, the exact hydrated
+   source snapshot, persona, route, build, and account fingerprints; it does not
+   contain imported plaintext.
+4. `run-live` consumes the account pool and readiness receipt, runs isolated
+   conversations concurrently, and keeps plaintext trajectories private. An
+   optional external semantic judge is an explicit plaintext egress. A second
+   deployment receipt after the run detects a deployment or worker change while
+   the arm was executing.
+5. The supervisor runs full-pool cleanup even when execution fails. Cleanup
+   checkpoints a recoverable content-free outcome before deleting the credential
+   manifest and publishing a hash-bound receipt. `finalize-arm` binds the private
+   result to the import, readiness, pre/post-run deployment, and cleanup receipts.
+6. `compare` accepts only compatible finalized baseline and candidate arms. It
+   checks the route, persona/source/evaluation/judge/coverage contracts, requires
+   different builds and disjoint account fingerprints, and writes an allowlisted
+   matrix, machine-readable result, and JUnit report. Raw trajectories and
+   per-account evidence remain private.
+
+The account count is isolation capacity rather than a container count. Chat and
+API-only evaluation needs separate account/session state; it does not require a
+Linux container per conversation.
+
+### Evaluation trust and receipt boundary
+
+The trusted supervisor owns provisioning/admin credentials, deployment
+serialization and verification, cleanup authority, and the receipt directory.
+The evaluator runner receives only the synthetic accounts needed for its arm and
+therefore sees their plaintext trajectories, but it must not receive an admin
+token or write access to supervisor-generated receipts.
+
+Receipt hashes prove that later artifacts refer to the same bytes; they are not
+signatures and do not authenticate a producer. File mode `0600` is insufficient
+when the runner shares the same operating-system identity or can write the
+parent directory. A formal deployment must place supervisor receipts behind an
+independent write boundary, such as a separate service account, a sandbox policy,
+or a read-only mount/file descriptor supplied to the runner. Keep private
+evidence outside published CI artifacts and delete it according to the
+evaluation retention policy after finalization.
+
 ## Security boundary summary
 
 Feedling's architecture is designed to provide:

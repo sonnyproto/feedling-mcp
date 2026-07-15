@@ -180,6 +180,47 @@ traffic until all enabled capabilities pass:
 Use synthetic accounts for probes. A health check must not mutate or decrypt a
 real user's data.
 
+## Optional formal upgrade regression gate
+
+Self-hosting operators can use the repository's formal live persona/memory
+evaluation before promoting a build. This is release tooling for an isolated
+test deployment, not a hosted Feedling service, public endpoint, or substitute
+for the capability checks above. See [Formal live persona and memory
+evaluation](/docs/architecture#formal-live-persona-and-memory-evaluation) for
+the artifact and trust model.
+
+Run the baseline and candidate arms serially when they share a test deployment.
+For each arm, the trusted supervisor must:
+
+1. lock the provider route and provision a fresh synthetic account pool;
+2. verify the deployed revision before and after importing one immutable,
+   hash-bound persona/memory source snapshot, then produce the readiness receipt;
+3. record a pre-run deployment receipt, execute the live conversations, and
+   record a post-run deployment receipt;
+4. clean the entire account pool even on failure and produce the cleanup
+   receipt; and
+5. finalize the arm before comparing it with the other build.
+
+The default release profile uses 24 accounts per arm (eight concurrent accounts
+across three repetitions), so a full baseline/candidate comparison consumes 48
+disjoint one-use accounts. Adjusted profiles must preserve account isolation and
+record their coverage contract; do not reuse production accounts or user data.
+
+Formal arms require `hosted_resident`; deployment verification must include
+homogeneous live worker identity and count in addition to the
+backend/deployment revision. Keep
+the deployment lock across preparation, the run, post-run verification, and
+cleanup so another rollout cannot invalidate the receipts.
+
+Run orchestration and receipt creation as a trusted supervisor. The conversation
+runner can receive arm-scoped account credentials and optional judge access, but
+must not receive admin/provider provisioning credentials or write access to the
+supervisor's receipt directory. Hash binding and restrictive file modes do not
+replace that independent filesystem or service-account boundary. Publish only
+the allowlisted comparison matrix, result, and JUnit output; treat readiness
+inputs, account pools, raw results, and plaintext trajectories as private
+artifacts with bounded retention.
+
 ## Backups and key lifecycle
 
 Back up PostgreSQL and every enabled object store as one recovery set. Database

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -10,6 +11,7 @@ from qa.regression import scenario_loader
 from qa.regression.scenario_loader import (
     LoaderError,
     load_suite_directory,
+    load_verified_source_fixture,
     loads_strict,
     verify_source_fixture,
 )
@@ -59,11 +61,88 @@ def test_checked_in_suite_loads_and_binds_existing_import_fixture():
     assert len(suite.evaluation_contract_sha256) == 64
 
 
+def test_verified_source_fixture_returns_hydrated_genesis_snapshot():
+    suite = load_suite_directory(
+        ROOT / "qa/regression/fixtures/golden-persona-mira-v1.json",
+        ROOT / "qa/regression/scenarios",
+    )
+    source_path = ROOT / "qa/fixtures/persona-import-v1.json"
+
+    fixture, fixture_sha256 = load_verified_source_fixture(suite.persona, source_path)
+
+    upload_files = fixture["materials"]["upload_files"]
+    assert set(upload_files) == {
+        "chat_history",
+        "ai_persona",
+        "personal_profile",
+        "memory_summary",
+    }
+    for upload_id, spec in upload_files.items():
+        assert fixture["materials"][upload_id] == (
+            source_path.parent / spec["path"]
+        ).read_text(encoding="utf-8")
+    genesis_canonical = (
+        json.dumps(
+            fixture,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert fixture_sha256 == hashlib.sha256(genesis_canonical).hexdigest()
+
+
+def test_verified_source_fixture_uses_each_material_snapshot_without_rereading(
+    tmp_path, monkeypatch
+):
+    suite = load_suite_directory(
+        ROOT / "qa/regression/fixtures/golden-persona-mira-v1.json",
+        ROOT / "qa/regression/scenarios",
+    )
+    source_path, material_root = _copy_source_fixture(tmp_path)
+    target = material_root / "ai-persona.md"
+    original = target.read_text(encoding="utf-8")
+    replacement = "changed-after-verified-read"
+    observed_paths: list[tuple[str, ...]] = []
+    real_read = scenario_loader._read_regular_material
+
+    def mutate_after_read(root, parts, **limits):
+        result = real_read(root, parts, **limits)
+        observed_paths.append(parts)
+        if parts[-1] == target.name:
+            target.write_text(replacement, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(scenario_loader, "_read_regular_material", mutate_after_read)
+    fixture, fixture_sha256 = load_verified_source_fixture(suite.persona, source_path)
+
+    assert target.read_text(encoding="utf-8") == replacement
+    assert fixture["materials"]["ai_persona"] == original
+    assert len(observed_paths) == len(set(observed_paths)) == 4
+    assert fixture_sha256 == scenario_loader._fixture_sha256(fixture)
+
+
+def test_verified_source_fixture_rejects_non_utf8_material(tmp_path):
+    suite = load_suite_directory(
+        ROOT / "qa/regression/fixtures/golden-persona-mira-v1.json",
+        ROOT / "qa/regression/scenarios",
+    )
+    source_path, material_root = _copy_source_fixture(tmp_path)
+    (material_root / "ai-persona.md").write_bytes(b"\xff")
+
+    with pytest.raises(LoaderError, match="not valid UTF-8"):
+        load_verified_source_fixture(suite.persona, source_path)
+
+
 def test_loader_rejects_duplicate_keys_and_non_finite_json():
     with pytest.raises(LoaderError, match="duplicate JSON key"):
         loads_strict('{"kind":"scenario","kind":"replacement"}')
     with pytest.raises(LoaderError, match="non-finite"):
         loads_strict('{"score":NaN}')
+    with pytest.raises(LoaderError, match="non-finite"):
+        loads_strict('{"score":1e999}')
 
 
 def test_source_bundle_fingerprint_changes_when_referenced_material_changes(tmp_path):
@@ -182,5 +261,33 @@ def test_source_material_streaming_read_cannot_cross_declared_limit(
             root,
             ("material.txt",),
             max_bytes=4,
+            aggregate_remaining_bytes=3,
+        )
+
+
+def test_source_material_snapshot_rejects_mutation_during_read(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "fixtures"
+    root.mkdir()
+    material = root / "material.txt"
+    material.write_bytes(b"abc")
+    real_read = scenario_loader.os.read
+    mutated = False
+
+    def mutate_after_first_chunk(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(descriptor, count)
+        if chunk and not mutated:
+            mutated = True
+            material.write_bytes(b"xyz")
+        return chunk
+
+    monkeypatch.setattr(scenario_loader.os, "read", mutate_after_first_chunk)
+    with pytest.raises(LoaderError, match="changed while reading"):
+        scenario_loader._read_regular_material(
+            root,
+            ("material.txt",),
+            max_bytes=3,
             aggregate_remaining_bytes=3,
         )

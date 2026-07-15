@@ -48,3 +48,37 @@ Envelope bodies remain ciphertext in the main API process. Some read-side
 operations forward authorized candidates to the enclave and return a limited
 decrypted projection. Read each workflow's privacy notes before choosing an
 endpoint.
+
+## Operator release-evaluation workflow
+
+The repository also contains a formal live workflow for testing persona and
+memory consistency across releases. It is deliberately separate from the public
+API workflows above:
+
+```text
+serialize deployment
+  -> provision 24 synthetic accounts for one arm
+  -> verify deployment and worker identity
+  -> import one hash-bound persona/memory snapshot
+  -> verify deployment/worker identity again and issue readiness receipt
+  -> issue pre-run deployment receipt
+  -> run isolated live conversations
+  -> issue post-run deployment receipt
+  -> checkpoint and clean the full pool, then issue cleanup receipt
+  -> finalize the arm
+  -> compare disjoint baseline and candidate arms
+```
+
+Twenty-four accounts is the default release-arm coverage (eight accounts times
+three repetitions), not a public API limit. The runner can process those
+independent account sessions concurrently without creating a container per
+conversation. The baseline and candidate must retain the same persona, source,
+route, evaluator, judge, and coverage contracts while using different builds
+and account pools.
+
+Only allowlisted aggregate outputs are suitable for publication. The trusted
+supervisor retains deployment and cleanup authority and protects receipts from
+runner writes; raw conversations and imported plaintext stay private. See the
+[architecture trust boundary](/docs/architecture#evaluation-trust-and-receipt-boundary)
+and the [self-hosting upgrade gate](/docs/self-hosting#optional-formal-upgrade-regression-gate)
+for the required isolation.

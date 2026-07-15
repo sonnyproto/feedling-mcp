@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,26 @@ from qa.regression.judge import ProviderClientJudge
 
 
 BUILD_SHA = "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("PASS", 0),
+        ("FAIL", 1),
+        ("BLOCKED_EVIDENCE", 2),
+        ("INFRA_ERROR", 2),
+    ],
+)
+def test_gate_exit_codes_distinguish_product_failure_from_invalid_evidence(
+    status, expected
+):
+    assert cli._gate_exit_code(status) == expected
+
+
+def test_gate_exit_code_rejects_unknown_status():
+    with pytest.raises(cli.CommandError, match="unknown status"):
+        cli._gate_exit_code("MAYBE")
 
 
 def _receipt(path: Path, *, verified_at: datetime | None = None) -> Path:
@@ -163,3 +184,77 @@ def test_live_cli_refuses_unimplemented_strong_rotation_before_accounts(capsys, 
     error = json.loads(capsys.readouterr().err)
     assert code == 2
     assert "runtime session rotator" in error["detail"]
+
+
+def test_strict_account_pool_requires_machine_readiness_and_batch_cleanup(
+    capsys, tmp_path
+):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    receipt = _receipt(private / "deployment.json")
+
+    code = cli.main(
+        [
+            "run-live",
+            "--account-pool",
+            str(private / "missing-pool.json"),
+            "--target-id",
+            "candidate-a",
+            "--target-label",
+            "candidate",
+            "--build-sha",
+            BUILD_SHA,
+            "--deployment-receipt",
+            str(receipt),
+            "--output",
+            str(private / "result.json"),
+            "--external-cleanup-guaranteed",
+        ]
+    )
+
+    error = json.loads(capsys.readouterr().err)
+    assert code == 2
+    assert "readiness-receipt" in error["detail"]
+
+
+def test_formal_account_pool_rejects_backend_only_runtime_before_live_mutation(
+    capsys, tmp_path, monkeypatch
+):
+    private = tmp_path / "private-runtime"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    monkeypatch.setattr(
+        cli,
+        "load_account_pool",
+        lambda path: SimpleNamespace(
+            deployment_runtime="deployed_current",
+            rows=(),
+        ),
+    )
+
+    code = cli.main(
+        [
+            "run-live",
+            "--account-pool",
+            str(private / "pool.json"),
+            "--readiness-receipt",
+            str(private / "readiness.json"),
+            "--target-id",
+            "candidate-a",
+            "--target-label",
+            "candidate",
+            "--build-sha",
+            BUILD_SHA,
+            "--deployment-receipt",
+            str(private / "deployment.json"),
+            "--output",
+            str(private / "result.json"),
+            "--external-cleanup-guaranteed",
+        ]
+    )
+
+    assert code == 2
+    assert "hosted_resident worker proof" in json.loads(
+        capsys.readouterr().err
+    )["detail"]
